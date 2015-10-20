@@ -15,13 +15,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Unknwon/com"
-	"github.com/macaron-contrib/oauth2"
-	"github.com/macaron-contrib/session"
 	"gopkg.in/ini.v1"
 
+	"github.com/Unknwon/com"
+	"github.com/go-macaron/session"
+
+	"github.com/gogits/gogs/modules/bindata"
 	"github.com/gogits/gogs/modules/log"
 	// "github.com/gogits/gogs/modules/ssh"
+	"github.com/gogits/gogs/modules/user"
 )
 
 type Scheme string
@@ -52,6 +54,7 @@ var (
 	HttpAddr, HttpPort string
 	DisableSSH         bool
 	SSHPort            int
+	SSHDomain          string
 	OfflineMode        bool
 	DisableRouterLog   bool
 	CertFile, KeyFile  string
@@ -67,16 +70,39 @@ var (
 	CookieRememberName   string
 	ReverseProxyAuthUser string
 
+	// Database settings.
+	UseSQLite3    bool
+	UseMySQL      bool
+	UsePostgreSQL bool
+	UseTiDB       bool
+
 	// Webhook settings.
 	Webhook struct {
-		TaskInterval   int
+		QueueLength    int
 		DeliverTimeout int
 		SkipTLSVerify  bool
+		Types          []string
+		PagingNum      int
 	}
 
 	// Repository settings.
 	RepoRootPath string
 	ScriptType   string
+	AnsiCharset  string
+
+	// UI settings.
+	ExplorePagingNum     int
+	IssuePagingNum       int
+	FeedMaxCommitNum     int
+	AdminUserPagingNum   int
+	AdminRepoPagingNum   int
+	AdminNoticePagingNum int
+	AdminOrgPagingNum    int
+
+	// Markdown sttings.
+	Markdown struct {
+		EnableHardLineBreak bool
+	}
 
 	// Picture settings.
 	PictureService   string
@@ -114,19 +140,37 @@ var (
 	Git struct {
 		MaxGitDiffLines int
 		GcArgs          []string `delim:" "`
-		Fsck            struct {
-			Enable   bool
-			Interval int
-			Args     []string `delim:" "`
-		} `ini:"git.fsck"`
+	}
+
+	// Cron tasks.
+	Cron struct {
+		UpdateMirror struct {
+			Enabled    bool
+			RunAtStart bool
+			Schedule   string
+		} `ini:"cron.update_mirrors"`
+		RepoHealthCheck struct {
+			Enabled    bool
+			RunAtStart bool
+			Schedule   string
+			Args       []string `delim:" "`
+		} `ini:"cron.repo_health_check"`
+		CheckRepoStats struct {
+			Enabled    bool
+			RunAtStart bool
+			Schedule   string
+		} `ini:"cron.check_repo_stats"`
 	}
 
 	// I18n settings.
 	Langs, Names []string
+	dateLangs    map[string]string
+
+	// Other settings.
+	ShowFooterBranding bool
 
 	// Global setting objects.
 	Cfg          *ini.File
-	ConfRootPath string
 	CustomPath   string // Custom directory path.
 	CustomConf   string
 	ProdMode     bool
@@ -134,6 +178,14 @@ var (
 	IsWindows    bool
 	HasRobotsTxt bool
 )
+
+func DateLang(lang string) string {
+	name, ok := dateLangs[lang]
+	if ok {
+		return name
+	}
+	return "en"
+}
 
 func init() {
 	IsWindows = runtime.GOOS == "windows"
@@ -154,31 +206,52 @@ func ExecPath() (string, error) {
 
 // WorkDir returns absolute path of work directory.
 func WorkDir() (string, error) {
+	wd := os.Getenv("GOGS_WORK_DIR")
+	if len(wd) > 0 {
+		return wd, nil
+	}
+
 	execPath, err := ExecPath()
-	return path.Dir(strings.Replace(execPath, "\\", "/", -1)), err
+	if err != nil {
+		return execPath, err
+	}
+
+	// Note: we don't use path.Dir here because it does not handle case
+	//	which path starts with two "/" in Windows: "//psf/Home/..."
+	execPath = strings.Replace(execPath, "\\", "/", -1)
+	i := strings.LastIndex(execPath, "/")
+	if i == -1 {
+		return execPath, nil
+	}
+	return execPath[:i], nil
 }
 
-// NewConfigContext initializes configuration context.
+func forcePathSeparator(path string) {
+	if strings.Contains(path, "\\") {
+		log.Fatal(4, "Do not use '\\' or '\\\\' in paths, instead, please use '/' in all places")
+	}
+}
+
+// NewContext initializes configuration context.
 // NOTE: do not print any log except error.
-func NewConfigContext() {
+func NewContext() {
 	workDir, err := WorkDir()
 	if err != nil {
 		log.Fatal(4, "Fail to get work directory: %v", err)
 	}
-	ConfRootPath = path.Join(workDir, "conf")
 
-	Cfg, err = ini.Load(path.Join(workDir, "conf/app.ini"))
+	Cfg, err = ini.Load(bindata.MustAsset("conf/app.ini"))
 	if err != nil {
 		log.Fatal(4, "Fail to parse 'conf/app.ini': %v", err)
 	}
 
 	CustomPath = os.Getenv("GOGS_CUSTOM")
 	if len(CustomPath) == 0 {
-		CustomPath = path.Join(workDir, "custom")
+		CustomPath = workDir + "/custom"
 	}
 
 	if len(CustomConf) == 0 {
-		CustomConf = path.Join(CustomPath, "conf/app.ini")
+		CustomConf = CustomPath + "/conf/app.ini"
 	}
 
 	if com.IsFile(CustomConf) {
@@ -191,6 +264,7 @@ func NewConfigContext() {
 	Cfg.NameMapper = ini.AllCapsUnderscore
 
 	LogRootPath = Cfg.Section("log").Key("ROOT_PATH").MustString(path.Join(workDir, "log"))
+	forcePathSeparator(LogRootPath)
 
 	sec := Cfg.Section("server")
 	AppName = Cfg.Section("").Key("APP_NAME").MustString("Gogs: Go Git Service")
@@ -218,6 +292,7 @@ func NewConfigContext() {
 	HttpAddr = sec.Key("HTTP_ADDR").MustString("0.0.0.0")
 	HttpPort = sec.Key("HTTP_PORT").MustString("3000")
 	DisableSSH = sec.Key("DISABLE_SSH").MustBool()
+	SSHDomain = sec.Key("SSH_DOMAIN").MustString(Domain)
 	SSHPort = sec.Key("SSH_PORT").MustInt(22)
 	OfflineMode = sec.Key("OFFLINE_MODE").MustBool()
 	DisableRouterLog = sec.Key("DISABLE_ROUTER_LOG").MustBool()
@@ -244,9 +319,9 @@ func NewConfigContext() {
 	if !filepath.IsAbs(AttachmentPath) {
 		AttachmentPath = path.Join(workDir, AttachmentPath)
 	}
-	AttachmentAllowedTypes = sec.Key("ALLOWED_TYPES").MustString("image/jpeg|image/png")
-	AttachmentMaxSize = sec.Key("MAX_SIZE").MustInt64(32)
-	AttachmentMaxFiles = sec.Key("MAX_FILES").MustInt(10)
+	AttachmentAllowedTypes = strings.Replace(sec.Key("ALLOWED_TYPES").MustString("image/jpeg,image/png"), "|", ",", -1)
+	AttachmentMaxSize = sec.Key("MAX_SIZE").MustInt64(4)
+	AttachmentMaxFiles = sec.Key("MAX_FILES").MustInt(5)
 	AttachmentEnabled = sec.Key("ENABLE").MustBool(true)
 
 	TimeFormat = map[string]string{
@@ -267,15 +342,8 @@ func NewConfigContext() {
 		"StampNano":   time.StampNano,
 	}[Cfg.Section("time").Key("FORMAT").MustString("RFC1123")]
 
-	if err = os.MkdirAll(AttachmentPath, os.ModePerm); err != nil {
-		log.Fatal(4, "Could not create directory %s: %s", AttachmentPath, err)
-	}
-
 	RunUser = Cfg.Section("").Key("RUN_USER").String()
-	curUser := os.Getenv("USER")
-	if len(curUser) == 0 {
-		curUser = os.Getenv("USERNAME")
-	}
+	curUser := user.CurrentUsername()
 	// Does not check run user when the install lock is off.
 	if InstallLock && RunUser != curUser {
 		log.Fatal(4, "Expect user(%s) but current user is: %s", RunUser, curUser)
@@ -286,44 +354,71 @@ func NewConfigContext() {
 	if err != nil {
 		log.Fatal(4, "Fail to get home directory: %v", err)
 	}
+	homeDir = strings.Replace(homeDir, "\\", "/", -1)
+
 	sec = Cfg.Section("repository")
-	RepoRootPath = sec.Key("ROOT").MustString(filepath.Join(homeDir, "gogs-repositories"))
+	RepoRootPath = sec.Key("ROOT").MustString(path.Join(homeDir, "gogs-repositories"))
+	forcePathSeparator(RepoRootPath)
 	if !filepath.IsAbs(RepoRootPath) {
-		RepoRootPath = filepath.Join(workDir, RepoRootPath)
+		RepoRootPath = path.Join(workDir, RepoRootPath)
 	} else {
-		RepoRootPath = filepath.Clean(RepoRootPath)
-	}
-	if err = os.MkdirAll(RepoRootPath, os.ModePerm); err != nil {
-		log.Fatal(4, "Fail to create repository root path(%s): %v", RepoRootPath, err)
+		RepoRootPath = path.Clean(RepoRootPath)
 	}
 	ScriptType = sec.Key("SCRIPT_TYPE").MustString("bash")
+	AnsiCharset = sec.Key("ANSI_CHARSET").MustString("")
+
+	// UI settings.
+	sec = Cfg.Section("ui")
+	ExplorePagingNum = sec.Key("EXPLORE_PAGING_NUM").MustInt(20)
+	IssuePagingNum = sec.Key("ISSUE_PAGING_NUM").MustInt(10)
+	FeedMaxCommitNum = sec.Key("FEED_MAX_COMMIT_NUM").MustInt(5)
+
+	sec = Cfg.Section("ui.admin")
+	AdminUserPagingNum = sec.Key("USER_PAGING_NUM").MustInt(50)
+	AdminRepoPagingNum = sec.Key("REPO_PAGING_NUM").MustInt(50)
+	AdminNoticePagingNum = sec.Key("NOTICE_PAGING_NUM").MustInt(50)
+	AdminOrgPagingNum = sec.Key("ORG_PAGING_NUM").MustInt(50)
 
 	sec = Cfg.Section("picture")
 	PictureService = sec.Key("SERVICE").In("server", []string{"server"})
 	AvatarUploadPath = sec.Key("AVATAR_UPLOAD_PATH").MustString("data/avatars")
+	forcePathSeparator(AvatarUploadPath)
 	if !filepath.IsAbs(AvatarUploadPath) {
 		AvatarUploadPath = path.Join(workDir, AvatarUploadPath)
 	}
-	os.MkdirAll(AvatarUploadPath, os.ModePerm)
-	switch sec.Key("GRAVATAR_SOURCE").MustString("gravatar") {
+	switch source := sec.Key("GRAVATAR_SOURCE").MustString("gravatar"); source {
 	case "duoshuo":
 		GravatarSource = "http://gravatar.duoshuo.com/avatar/"
-	default:
+	case "gravatar":
 		GravatarSource = "//1.gravatar.com/avatar/"
+	default:
+		GravatarSource = source
 	}
 	DisableGravatar = sec.Key("DISABLE_GRAVATAR").MustBool()
+	if OfflineMode {
+		DisableGravatar = true
+	}
 
-	if err = Cfg.Section("git").MapTo(&Git); err != nil {
+	if err = Cfg.Section("markdown").MapTo(&Markdown); err != nil {
+		log.Fatal(4, "Fail to map Markdown settings: %v", err)
+	} else if err = Cfg.Section("git").MapTo(&Git); err != nil {
 		log.Fatal(4, "Fail to map Git settings: %v", err)
+	} else if Cfg.Section("cron").MapTo(&Cron); err != nil {
+		log.Fatal(4, "Fail to map Cron settings: %v", err)
 	}
 
 	Langs = Cfg.Section("i18n").Key("LANGS").Strings(",")
 	Names = Cfg.Section("i18n").Key("NAMES").Strings(",")
+	dateLangs = Cfg.Section("i18n.datelang").KeysHash()
+
+	ShowFooterBranding = Cfg.Section("other").Key("SHOW_FOOTER_BRANDING").MustBool()
 
 	HasRobotsTxt = com.IsFile(path.Join(CustomPath, "robots.txt"))
 }
 
 var Service struct {
+	ActiveCodeLives                int
+	ResetPwdCodeLives              int
 	RegisterEmailConfirm           bool
 	DisableRegistration            bool
 	ShowRegistrationButton         bool
@@ -332,19 +427,22 @@ var Service struct {
 	EnableNotifyMail               bool
 	EnableReverseProxyAuth         bool
 	EnableReverseProxyAutoRegister bool
-	ActiveCodeLives                int
-	ResetPwdCodeLives              int
+	DisableMinimumKeySizeCheck     bool
+	EnableCaptcha                  bool
 }
 
 func newService() {
-	Service.ActiveCodeLives = Cfg.Section("service").Key("ACTIVE_CODE_LIVE_MINUTES").MustInt(180)
-	Service.ResetPwdCodeLives = Cfg.Section("service").Key("RESET_PASSWD_CODE_LIVE_MINUTES").MustInt(180)
-	Service.DisableRegistration = Cfg.Section("service").Key("DISABLE_REGISTRATION").MustBool()
-	Service.ShowRegistrationButton = Cfg.Section("service").Key("SHOW_REGISTRATION_BUTTON").MustBool(!Service.DisableRegistration)
-	Service.RequireSignInView = Cfg.Section("service").Key("REQUIRE_SIGNIN_VIEW").MustBool()
-	Service.EnableCacheAvatar = Cfg.Section("service").Key("ENABLE_CACHE_AVATAR").MustBool()
-	Service.EnableReverseProxyAuth = Cfg.Section("service").Key("ENABLE_REVERSE_PROXY_AUTHENTICATION").MustBool()
-	Service.EnableReverseProxyAutoRegister = Cfg.Section("service").Key("ENABLE_REVERSE_PROXY_AUTO_REGISTERATION").MustBool()
+	sec := Cfg.Section("service")
+	Service.ActiveCodeLives = sec.Key("ACTIVE_CODE_LIVE_MINUTES").MustInt(180)
+	Service.ResetPwdCodeLives = sec.Key("RESET_PASSWD_CODE_LIVE_MINUTES").MustInt(180)
+	Service.DisableRegistration = sec.Key("DISABLE_REGISTRATION").MustBool()
+	Service.ShowRegistrationButton = sec.Key("SHOW_REGISTRATION_BUTTON").MustBool(!Service.DisableRegistration)
+	Service.RequireSignInView = sec.Key("REQUIRE_SIGNIN_VIEW").MustBool()
+	Service.EnableCacheAvatar = sec.Key("ENABLE_CACHE_AVATAR").MustBool()
+	Service.EnableReverseProxyAuth = sec.Key("ENABLE_REVERSE_PROXY_AUTHENTICATION").MustBool()
+	Service.EnableReverseProxyAutoRegister = sec.Key("ENABLE_REVERSE_PROXY_AUTO_REGISTRATION").MustBool()
+	Service.DisableMinimumKeySizeCheck = sec.Key("DISABLE_MINIMUM_KEY_SIZE_CHECK").MustBool()
+	Service.EnableCaptcha = sec.Key("ENABLE_CAPTCHA").MustBool()
 }
 
 var logLevels = map[string]string{
@@ -369,9 +467,11 @@ func newLogService() {
 			log.Fatal(4, "Unknown log mode: %s", mode)
 		}
 
+		validLevels := []string{"Trace", "Debug", "Info", "Warn", "Error", "Critical"}
 		// Log level.
-		levelName := Cfg.Section("log."+mode).Key("LEVEL").In("Trace",
-			[]string{"Trace", "Debug", "Info", "Warn", "Error", "Critical"})
+		levelName := Cfg.Section("log."+mode).Key("LEVEL").In(
+			Cfg.Section("log").Key("LEVEL").In("Trace", validLevels),
+			validLevels)
 		level, ok := logLevels[levelName]
 		if !ok {
 			log.Fatal(4, "Unknown log level: %s", levelName)
@@ -419,10 +519,10 @@ func newLogService() {
 func newCacheService() {
 	CacheAdapter = Cfg.Section("cache").Key("ADAPTER").In("memory", []string{"memory", "redis", "memcache"})
 	if EnableRedis {
-		log.Info("Redis Enabled")
+		log.Info("Redis Supported")
 	}
 	if EnableMemcache {
-		log.Info("Memcache Enabled")
+		log.Info("Memcache Supported")
 	}
 
 	switch CacheAdapter {
@@ -452,28 +552,20 @@ func newSessionService() {
 
 // Mailer represents mail service.
 type Mailer struct {
-	Name         string
-	Host         string
-	From         string
-	User, Passwd string
-	SkipVerify   bool
-}
-
-type OauthInfo struct {
-	oauth2.Options
-	AuthUrl, TokenUrl string
-}
-
-// Oauther represents oauth service.
-type Oauther struct {
-	GitHub, Google, Tencent,
-	Twitter, Weibo bool
-	OauthInfos map[string]*OauthInfo
+	QueueLength       int
+	Name              string
+	Host              string
+	From              string
+	User, Passwd      string
+	DisableHelo       bool
+	HeloHostname      string
+	SkipVerify        bool
+	UseCertificate    bool
+	CertFile, KeyFile string
 }
 
 var (
-	MailService  *Mailer
-	OauthService *Oauther
+	MailService *Mailer
 )
 
 func newMailService() {
@@ -484,11 +576,17 @@ func newMailService() {
 	}
 
 	MailService = &Mailer{
-		Name:       sec.Key("NAME").MustString(AppName),
-		Host:       sec.Key("HOST").String(),
-		User:       sec.Key("USER").String(),
-		Passwd:     sec.Key("PASSWD").String(),
-		SkipVerify: sec.Key("SKIP_VERIFY").MustBool(),
+		QueueLength:    sec.Key("SEND_BUFFER_LEN").MustInt(100),
+		Name:           sec.Key("NAME").MustString(AppName),
+		Host:           sec.Key("HOST").String(),
+		User:           sec.Key("USER").String(),
+		Passwd:         sec.Key("PASSWD").String(),
+		DisableHelo:    sec.Key("DISABLE_HELO").MustBool(),
+		HeloHostname:   sec.Key("HELO_HOSTNAME").String(),
+		SkipVerify:     sec.Key("SKIP_VERIFY").MustBool(),
+		UseCertificate: sec.Key("USE_CERTIFICATE").MustBool(),
+		CertFile:       sec.Key("CERT_FILE").String(),
+		KeyFile:        sec.Key("KEY_FILE").String(),
 	}
 	MailService.From = sec.Key("FROM").MustString(MailService.User)
 	log.Info("Mail Service Enabled")
@@ -518,9 +616,11 @@ func newNotifyMailService() {
 
 func newWebhookService() {
 	sec := Cfg.Section("webhook")
-	Webhook.TaskInterval = sec.Key("TASK_INTERVAL").MustInt(1)
+	Webhook.QueueLength = sec.Key("QUEUE_LENGTH").MustInt(1000)
 	Webhook.DeliverTimeout = sec.Key("DELIVER_TIMEOUT").MustInt(5)
 	Webhook.SkipTLSVerify = sec.Key("SKIP_TLS_VERIFY").MustBool()
+	Webhook.Types = []string{"gogs", "slack"}
+	Webhook.PagingNum = sec.Key("PAGING_NUM").MustInt(10)
 }
 
 func NewServices() {

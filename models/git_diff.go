@@ -86,8 +86,7 @@ func ParsePatch(pid int64, maxlines int, cmd *exec.Cmd, reader io.Reader) (*Diff
 		}
 
 		leftLine, rightLine int
-		isTooLong           bool
-		// FIXME: use first 30 lines to detect file encoding. Should use cache in the future.
+		// FIXME: Should use cache in the future.
 		buf bytes.Buffer
 	)
 
@@ -106,16 +105,11 @@ func ParsePatch(pid int64, maxlines int, cmd *exec.Cmd, reader io.Reader) (*Diff
 
 		i = i + 1
 
-		// FIXME: use first 30 lines to detect file encoding.
-		if i <= 30 {
-			buf.WriteString(line)
-		}
-
 		// Diff data too large, we only show the first about maxlines lines
-		if i == maxlines {
-			isTooLong = true
+		if i >= maxlines {
 			log.Warn("Diff data too large")
-			//return &Diff{}, nil
+			diff.Files = nil
+			return diff, nil
 		}
 
 		switch {
@@ -126,10 +120,6 @@ func ParsePatch(pid int64, maxlines int, cmd *exec.Cmd, reader io.Reader) (*Diff
 			curSection.Lines = append(curSection.Lines, diffLine)
 			continue
 		case line[0] == '@':
-			if isTooLong {
-				return diff, nil
-			}
-
 			curSection = &DiffSection{}
 			curFile.Sections = append(curFile.Sections, curSection)
 			ss := strings.Split(line, "@@")
@@ -137,9 +127,14 @@ func ParsePatch(pid int64, maxlines int, cmd *exec.Cmd, reader io.Reader) (*Diff
 			curSection.Lines = append(curSection.Lines, diffLine)
 
 			// Parse line number.
-			ranges := strings.Split(ss[len(ss)-2][1:], " ")
+			ranges := strings.Split(ss[1][1:], " ")
 			leftLine, _ = com.StrTo(strings.Split(ranges[0], ",")[0][1:]).Int()
-			rightLine, _ = com.StrTo(strings.Split(ranges[1], ",")[0]).Int()
+			if len(ranges) > 1 {
+				rightLine, _ = com.StrTo(strings.Split(ranges[1], ",")[0]).Int()
+			} else {
+				log.Warn("Parse line number failed: %v", line)
+				rightLine = leftLine
+			}
 			continue
 		case line[0] == '+':
 			curFile.Addition++
@@ -163,12 +158,14 @@ func ParsePatch(pid int64, maxlines int, cmd *exec.Cmd, reader io.Reader) (*Diff
 
 		// Get new file.
 		if strings.HasPrefix(line, DIFF_HEAD) {
-			if isTooLong {
-				return diff, nil
-			}
+			beg := len(DIFF_HEAD)
+			a := line[beg : (len(line)-beg)/2+beg]
 
-			fs := strings.Split(line[len(DIFF_HEAD):], " ")
-			a := fs[0]
+			// In case file name is surrounded by double quotes(it happens only in git-shell).
+			if a[0] == '"' {
+				a = a[1 : len(a)-1]
+				a = strings.Replace(a, `\"`, `"`, -1)
+			}
 
 			curFile = &DiffFile{
 				Name:     a[strings.Index(a, "/")+1:],
@@ -201,14 +198,19 @@ func ParsePatch(pid int64, maxlines int, cmd *exec.Cmd, reader io.Reader) (*Diff
 		}
 	}
 
-	// FIXME: use first 30 lines to detect file encoding.
-	charsetLabel, err := base.DetectEncoding(buf.Bytes())
-	if charsetLabel != "utf8" && err == nil {
-		encoding, _ := charset.Lookup(charsetLabel)
-
-		if encoding != nil {
-			d := encoding.NewDecoder()
-			for _, f := range diff.Files {
+	for _, f := range diff.Files {
+		buf.Reset()
+		for _, sec := range f.Sections {
+			for _, l := range sec.Lines {
+				buf.WriteString(l.Content)
+				buf.WriteString("\n")
+			}
+		}
+		charsetLabel, err := base.DetectEncoding(buf.Bytes())
+		if charsetLabel != "UTF-8" && err == nil {
+			encoding, _ := charset.Lookup(charsetLabel)
+			if encoding != nil {
+				d := encoding.NewDecoder()
 				for _, sec := range f.Sections {
 					for _, l := range sec.Lines {
 						if c, _, err := transform.String(d, l.Content); err == nil {
@@ -219,7 +221,6 @@ func ParsePatch(pid int64, maxlines int, cmd *exec.Cmd, reader io.Reader) (*Diff
 			}
 		}
 	}
-
 	return diff, nil
 }
 

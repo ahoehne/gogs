@@ -9,6 +9,7 @@ import (
 	"path"
 
 	"github.com/Unknwon/com"
+	"github.com/Unknwon/paginater"
 
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/base"
@@ -44,7 +45,7 @@ func RenderIssueLinks(oldCommits *list.List, repoLink string) *list.List {
 }
 
 func Commits(ctx *middleware.Context) {
-	ctx.Data["IsRepoToolbarCommits"] = true
+	ctx.Data["PageIsCommits"] = true
 
 	userName := ctx.Repo.Owner.Name
 	repoName := ctx.Repo.Repository.Name
@@ -64,19 +65,11 @@ func Commits(ctx *middleware.Context) {
 		return
 	}
 
-	// Calculate and validate page number.
-	page, _ := com.StrTo(ctx.Query("p")).Int()
-	if page < 1 {
+	page := ctx.QueryInt("page")
+	if page <= 1 {
 		page = 1
 	}
-	lastPage := page - 1
-	if lastPage < 0 {
-		lastPage = 0
-	}
-	nextPage := page + 1
-	if page*50 > commitsCount {
-		nextPage = 0
-	}
+	ctx.Data["Page"] = paginater.New(commitsCount, git.CommitsRangeSize, page, 5)
 
 	// Both `git log branchName` and `git log commitId` work.
 	commits, err := ctx.Repo.Commit.CommitsByRange(page)
@@ -91,14 +84,11 @@ func Commits(ctx *middleware.Context) {
 	ctx.Data["Username"] = userName
 	ctx.Data["Reponame"] = repoName
 	ctx.Data["CommitCount"] = commitsCount
-	ctx.Data["LastPageNum"] = lastPage
-	ctx.Data["NextPageNum"] = nextPage
 	ctx.HTML(200, COMMITS)
 }
 
 func SearchCommits(ctx *middleware.Context) {
-	ctx.Data["IsSearchPage"] = true
-	ctx.Data["IsRepoToolbarCommits"] = true
+	ctx.Data["PageIsCommits"] = true
 
 	keyword := ctx.Query("q")
 	if len(keyword) == 0 {
@@ -199,38 +189,19 @@ func FileHistory(ctx *middleware.Context) {
 }
 
 func Diff(ctx *middleware.Context) {
-	ctx.Data["IsRepoToolbarCommits"] = true
+	ctx.Data["PageIsDiff"] = true
 
 	userName := ctx.Repo.Owner.Name
 	repoName := ctx.Repo.Repository.Name
-	commitId := ctx.Repo.CommitId
+	commitID := ctx.Repo.CommitID
 
 	commit := ctx.Repo.Commit
 	commit.CommitMessage = commit.CommitMessage
 	diff, err := models.GetDiffCommit(models.RepoPath(userName, repoName),
-		commitId, setting.Git.MaxGitDiffLines)
+		commitID, setting.Git.MaxGitDiffLines)
 	if err != nil {
 		ctx.Handle(404, "GetDiffCommit", err)
 		return
-	}
-
-	isImageFile := func(name string) bool {
-		blob, err := ctx.Repo.Commit.GetBlobByPath(name)
-		if err != nil {
-			return false
-		}
-
-		dataRc, err := blob.Data()
-		if err != nil {
-			return false
-		}
-		buf := make([]byte, 1024)
-		n, _ := dataRc.Read(buf)
-		if n > 0 {
-			buf = buf[:n]
-		}
-		_, isImage := base.IsImageFile(buf)
-		return isImage
 	}
 
 	parents := make([]string, commit.ParentCount())
@@ -245,18 +216,18 @@ func Diff(ctx *middleware.Context) {
 
 	ctx.Data["Username"] = userName
 	ctx.Data["Reponame"] = repoName
-	ctx.Data["IsImageFile"] = isImageFile
-	ctx.Data["Title"] = commit.Summary() + " · " + base.ShortSha(commitId)
+	ctx.Data["IsImageFile"] = commit.IsImageFile
+	ctx.Data["Title"] = commit.Summary() + " · " + base.ShortSha(commitID)
 	ctx.Data["Commit"] = commit
 	ctx.Data["Author"] = models.ValidateCommitWithEmail(commit)
 	ctx.Data["Diff"] = diff
 	ctx.Data["Parents"] = parents
 	ctx.Data["DiffNotAvailable"] = diff.NumFiles() == 0
-	ctx.Data["SourcePath"] = setting.AppSubUrl + "/" + path.Join(userName, repoName, "src", commitId)
-	if (commit.ParentCount() > 0) {
+	ctx.Data["SourcePath"] = setting.AppSubUrl + "/" + path.Join(userName, repoName, "src", commitID)
+	if commit.ParentCount() > 0 {
 		ctx.Data["BeforeSourcePath"] = setting.AppSubUrl + "/" + path.Join(userName, repoName, "src", parents[0])
 	}
-	ctx.Data["RawPath"] = setting.AppSubUrl + "/" + path.Join(userName, repoName, "raw", commitId)
+	ctx.Data["RawPath"] = setting.AppSubUrl + "/" + path.Join(userName, repoName, "raw", commitID)
 	ctx.HTML(200, DIFF)
 }
 
@@ -265,61 +236,43 @@ func CompareDiff(ctx *middleware.Context) {
 	ctx.Data["IsDiffCompare"] = true
 	userName := ctx.Repo.Owner.Name
 	repoName := ctx.Repo.Repository.Name
-	beforeCommitId := ctx.Params(":before")
-	afterCommitId := ctx.Params(":after")
+	beforeCommitID := ctx.Params(":before")
+	afterCommitID := ctx.Params(":after")
 
-	commit, err := ctx.Repo.GitRepo.GetCommit(afterCommitId)
+	commit, err := ctx.Repo.GitRepo.GetCommit(afterCommitID)
 	if err != nil {
 		ctx.Handle(404, "GetCommit", err)
 		return
 	}
 
-	diff, err := models.GetDiffRange(models.RepoPath(userName, repoName), beforeCommitId,
-		afterCommitId, setting.Git.MaxGitDiffLines)
+	diff, err := models.GetDiffRange(models.RepoPath(userName, repoName), beforeCommitID,
+		afterCommitID, setting.Git.MaxGitDiffLines)
 	if err != nil {
 		ctx.Handle(404, "GetDiffRange", err)
 		return
 	}
 
-	isImageFile := func(name string) bool {
-		blob, err := commit.GetBlobByPath(name)
-		if err != nil {
-			return false
-		}
-
-		dataRc, err := blob.Data()
-		if err != nil {
-			return false
-		}
-		buf := make([]byte, 1024)
-		n, _ := dataRc.Read(buf)
-		if n > 0 {
-			buf = buf[:n]
-		}
-		_, isImage := base.IsImageFile(buf)
-		return isImage
-	}
-
-	commits, err := commit.CommitsBeforeUntil(beforeCommitId)
+	commits, err := commit.CommitsBeforeUntil(beforeCommitID)
 	if err != nil {
 		ctx.Handle(500, "CommitsBeforeUntil", err)
 		return
 	}
 	commits = models.ValidateCommitsWithEmails(commits)
 
+	ctx.Data["CommitRepoLink"] = ctx.Repo.RepoLink
 	ctx.Data["Commits"] = commits
 	ctx.Data["CommitCount"] = commits.Len()
-	ctx.Data["BeforeCommitId"] = beforeCommitId
-	ctx.Data["AfterCommitId"] = afterCommitId
+	ctx.Data["BeforeCommitID"] = beforeCommitID
+	ctx.Data["AfterCommitID"] = afterCommitID
 	ctx.Data["Username"] = userName
 	ctx.Data["Reponame"] = repoName
-	ctx.Data["IsImageFile"] = isImageFile
-	ctx.Data["Title"] = "Comparing " + base.ShortSha(beforeCommitId) + "..." + base.ShortSha(afterCommitId) + " · " + userName + "/" + repoName
+	ctx.Data["IsImageFile"] = commit.IsImageFile
+	ctx.Data["Title"] = "Comparing " + base.ShortSha(beforeCommitID) + "..." + base.ShortSha(afterCommitID) + " · " + userName + "/" + repoName
 	ctx.Data["Commit"] = commit
 	ctx.Data["Diff"] = diff
 	ctx.Data["DiffNotAvailable"] = diff.NumFiles() == 0
-	ctx.Data["SourcePath"] = setting.AppSubUrl + "/" + path.Join(userName, repoName, "src", afterCommitId)
-	ctx.Data["BeforeSourcePath"] = setting.AppSubUrl + "/" + path.Join(userName, repoName, "src", beforeCommitId)
-	ctx.Data["RawPath"] = setting.AppSubUrl + "/" + path.Join(userName, repoName, "raw", afterCommitId)
+	ctx.Data["SourcePath"] = setting.AppSubUrl + "/" + path.Join(userName, repoName, "src", afterCommitID)
+	ctx.Data["BeforeSourcePath"] = setting.AppSubUrl + "/" + path.Join(userName, repoName, "src", beforeCommitID)
+	ctx.Data["RawPath"] = setting.AppSubUrl + "/" + path.Join(userName, repoName, "raw", afterCommitID)
 	ctx.HTML(200, DIFF)
 }

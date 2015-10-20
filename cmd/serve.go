@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,9 +16,14 @@ import (
 	"github.com/codegangsta/cli"
 
 	"github.com/gogits/gogs/models"
+	"github.com/gogits/gogs/modules/httplib"
 	"github.com/gogits/gogs/modules/log"
 	"github.com/gogits/gogs/modules/setting"
 	"github.com/gogits/gogs/modules/uuid"
+)
+
+const (
+	_ACCESS_DENIED_MESSAGE = "Repository does not exist or you do not have access"
 )
 
 var CmdServ = cli.Command{
@@ -33,7 +37,7 @@ var CmdServ = cli.Command{
 }
 
 func setup(logPath string) {
-	setting.NewConfigContext()
+	setting.NewContext()
 	log.NewGitLogger(filepath.Join(setting.LogRootPath, logPath))
 
 	if setting.DisableSSH {
@@ -41,9 +45,9 @@ func setup(logPath string) {
 		os.Exit(1)
 	}
 
-	models.LoadModelsConfig()
+	models.LoadConfigs()
 
-	if models.UseSQLite3 {
+	if setting.UseSQLite3 || setting.UseTiDB {
 		workDir, _ := setting.WorkDir()
 		os.Chdir(workDir)
 	}
@@ -56,67 +60,36 @@ func parseCmd(cmd string) (string, string) {
 	if len(ss) != 2 {
 		return "", ""
 	}
-
-	verb, args := ss[0], ss[1]
-	if verb == "git" {
-		ss = strings.SplitN(args, " ", 2)
-		args = ss[1]
-		verb = fmt.Sprintf("%s %s", verb, ss[0])
-	}
-	return verb, strings.Replace(args, "'/", "'", 1)
+	return ss[0], strings.Replace(ss[1], "'/", "'", 1)
 }
 
 var (
-	COMMANDS_READONLY = map[string]models.AccessType{
-		"git-upload-pack":    models.WRITABLE,
-		"git upload-pack":    models.WRITABLE,
-		"git-upload-archive": models.WRITABLE,
-	}
-
-	COMMANDS_WRITE = map[string]models.AccessType{
-		"git-receive-pack": models.READABLE,
-		"git receive-pack": models.READABLE,
+	COMMANDS = map[string]models.AccessMode{
+		"git-upload-pack":    models.ACCESS_MODE_READ,
+		"git-upload-archive": models.ACCESS_MODE_READ,
+		"git-receive-pack":   models.ACCESS_MODE_WRITE,
 	}
 )
 
-func In(b string, sl map[string]models.AccessType) bool {
-	_, e := sl[b]
-	return e
+func fail(userMessage, logMessage string, args ...interface{}) {
+	fmt.Fprintln(os.Stderr, "Gogs:", userMessage)
+	log.GitLogger.Fatal(3, logMessage, args...)
 }
 
-func runServ(k *cli.Context) {
-	if k.IsSet("config") {
-		setting.CustomConf = k.String("config")
+func runServ(c *cli.Context) {
+	if c.IsSet("config") {
+		setting.CustomConf = c.String("config")
 	}
 	setup("serv.log")
 
-	if len(k.Args()) < 1 {
-		log.GitLogger.Fatal(2, "Not enough arguments")
-	}
-	keys := strings.Split(k.Args()[0], "-")
-	if len(keys) != 2 {
-		println("Gogs: auth file format error")
-		log.GitLogger.Fatal(2, "Invalid auth file format: %s", os.Args[2])
-	}
-
-	keyId, err := com.StrTo(keys[1]).Int64()
-	if err != nil {
-		println("Gogs: auth file format error")
-		log.GitLogger.Fatal(2, "Invalid auth file format: %v", err)
-	}
-	user, err := models.GetUserByKeyId(keyId)
-	if err != nil {
-		if err == models.ErrUserNotKeyOwner {
-			println("Gogs: you are not the owner of SSH key")
-			log.GitLogger.Fatal(2, "Invalid owner of SSH key: %d", keyId)
-		}
-		println("Gogs: internal error:", err.Error())
-		log.GitLogger.Fatal(2, "Fail to get user by key ID(%d): %v", keyId, err)
+	if len(c.Args()) < 1 {
+		fail("Not enough arguments", "Not enough arguments")
 	}
 
 	cmd := os.Getenv("SSH_ORIGINAL_COMMAND")
-	if cmd == "" {
-		println("Hi", user.Name, "! You've successfully authenticated, but Gogs does not provide shell access.")
+	if len(cmd) == 0 {
+		println("Hi there, You've successfully authenticated, but Gogs does not provide shell access.")
+		println("If this is unexpected, please log in with password and setup Gogs under another user.")
 		return
 	}
 
@@ -124,62 +97,88 @@ func runServ(k *cli.Context) {
 	repoPath := strings.Trim(args, "'")
 	rr := strings.SplitN(repoPath, "/", 2)
 	if len(rr) != 2 {
-		println("Gogs: unavailable repository", args)
-		log.GitLogger.Fatal(2, "Unavailable repository: %v", args)
+		fail("Invalid repository path", "Invalid repository path: %v", args)
 	}
 	repoUserName := rr[0]
 	repoName := strings.TrimSuffix(rr[1], ".git")
 
-	isWrite := In(verb, COMMANDS_WRITE)
-	isRead := In(verb, COMMANDS_READONLY)
-
 	repoUser, err := models.GetUserByName(repoUserName)
 	if err != nil {
-		if err == models.ErrUserNotExist {
-			println("Gogs: given repository owner are not registered")
-			log.GitLogger.Fatal(2, "Unregistered owner: %s", repoUserName)
+		if models.IsErrUserNotExist(err) {
+			fail("Repository owner does not exist", "Unregistered owner: %s", repoUserName)
 		}
-		println("Gogs: internal error:", err.Error())
-		log.GitLogger.Fatal(2, "Fail to get repository owner(%s): %v", repoUserName, err)
+		fail("Internal error", "Failed to get repository owner(%s): %v", repoUserName, err)
 	}
 
-	// Access check.
-	switch {
-	case isWrite:
-		has, err := models.HasAccess(user.Name, path.Join(repoUserName, repoName), models.WRITABLE)
-		if err != nil {
-			println("Gogs: internal error:", err.Error())
-			log.GitLogger.Fatal(2, "Fail to check write access:", err)
-		} else if !has {
-			println("You have no right to write this repository")
-			log.GitLogger.Fatal(2, "User %s has no right to write repository %s", user.Name, repoPath)
+	repo, err := models.GetRepositoryByName(repoUser.Id, repoName)
+	if err != nil {
+		if models.IsErrRepoNotExist(err) {
+			fail(_ACCESS_DENIED_MESSAGE, "Repository does not exist: %s/%s", repoUser.Name, repoName)
 		}
-	case isRead:
-		repo, err := models.GetRepositoryByName(repoUser.Id, repoName)
+		fail("Internal error", "Failed to get repository: %v", err)
+	}
+
+	requestedMode, has := COMMANDS[verb]
+	if !has {
+		fail("Unknown git command", "Unknown git command %s", verb)
+	}
+
+	// Allow anonymous clone for public repositories.
+	var (
+		keyID int64
+		user  *models.User
+	)
+	if requestedMode == models.ACCESS_MODE_WRITE || repo.IsPrivate {
+		keys := strings.Split(c.Args()[0], "-")
+		if len(keys) != 2 {
+			fail("Key ID format error", "Invalid key ID: %s", c.Args()[0])
+		}
+
+		key, err := models.GetPublicKeyByID(com.StrTo(keys[1]).MustInt64())
 		if err != nil {
-			if err == models.ErrRepoNotExist {
-				println("Gogs: given repository does not exist")
-				log.GitLogger.Fatal(2, "Repository does not exist: %s/%s", repoUser.Name, repoName)
+			fail("Key ID format error", "Invalid key ID[%s]: %v", c.Args()[0], err)
+		}
+		keyID = key.ID
+
+		// Check deploy key or user key.
+		if key.Type == models.KEY_TYPE_DEPLOY {
+			if key.Mode < requestedMode {
+				fail("Key permission denied", "Cannot push with deployment key: %d", key.ID)
 			}
-			println("Gogs: internal error:", err.Error())
-			log.GitLogger.Fatal(2, "Fail to get repository: %v", err)
-		}
+			// Check if this deploy key belongs to current repository.
+			if !models.HasDeployKey(key.ID, repo.ID) {
+				fail("Key access denied", "Key access denied: %d-%d", key.ID, repo.ID)
+			}
 
-		if !repo.IsPrivate {
-			break
-		}
+			// Update deploy key activity.
+			deployKey, err := models.GetDeployKeyByRepo(key.ID, repo.ID)
+			if err != nil {
+				fail("Internal error", "GetDeployKey: %v", err)
+			}
 
-		has, err := models.HasAccess(user.Name, path.Join(repoUserName, repoName), models.READABLE)
-		if err != nil {
-			println("Gogs: internal error:", err.Error())
-			log.GitLogger.Fatal(2, "Fail to check read access:", err)
-		} else if !has {
-			println("You have no right to access this repository")
-			log.GitLogger.Fatal(2, "User %s has no right to read repository %s", user.Name, repoPath)
+			deployKey.Updated = time.Now()
+			if err = models.UpdateDeployKey(deployKey); err != nil {
+				fail("Internal error", "UpdateDeployKey: %v", err)
+			}
+		} else {
+			user, err = models.GetUserByKeyId(key.ID)
+			if err != nil {
+				fail("internal error", "Failed to get user by key ID(%d): %v", keyID, err)
+			}
+
+			mode, err := models.AccessLevel(user, repo)
+			if err != nil {
+				fail("Internal error", "Fail to check access: %v", err)
+			} else if mode < requestedMode {
+				clientMessage := _ACCESS_DENIED_MESSAGE
+				if mode >= models.ACCESS_MODE_READ {
+					clientMessage = "You do not have sufficient authorization for this action"
+				}
+				fail(clientMessage,
+					"User %s does not have level %v access to repository %s",
+					user.Name, requestedMode, repoPath)
+			}
 		}
-	default:
-		println("Unknown command: " + cmd)
-		return
 	}
 
 	uuid := uuid.NewV4().String()
@@ -197,11 +196,10 @@ func runServ(k *cli.Context) {
 	gitcmd.Stdin = os.Stdin
 	gitcmd.Stderr = os.Stderr
 	if err = gitcmd.Run(); err != nil {
-		println("Gogs: internal error:", err.Error())
-		log.GitLogger.Fatal(2, "Fail to execute git command: %v", err)
+		fail("Internal error", "Failed to execute git command: %v", err)
 	}
 
-	if isWrite {
+	if requestedMode == models.ACCESS_MODE_WRITE {
 		tasks, err := models.GetUpdateTasksByUuid(uuid)
 		if err != nil {
 			log.GitLogger.Fatal(2, "GetUpdateTasksByUuid: %v", err)
@@ -211,7 +209,7 @@ func runServ(k *cli.Context) {
 			err = models.Update(task.RefName, task.OldCommitId, task.NewCommitId,
 				user.Name, repoUserName, repoName, user.Id)
 			if err != nil {
-				log.GitLogger.Error(2, "Fail to update: %v", err)
+				log.GitLogger.Error(2, "Failed to update: %v", err)
 			}
 		}
 
@@ -220,13 +218,26 @@ func runServ(k *cli.Context) {
 		}
 	}
 
-	// Update key activity.
-	key, err := models.GetPublicKeyById(keyId)
-	if err != nil {
-		log.GitLogger.Fatal(2, "GetPublicKeyById: %v", err)
+	// Send deliver hook request.
+	reqURL := setting.AppUrl + repoUserName + "/" + repoName + "/hooks/trigger"
+	resp, err := httplib.Head(reqURL).Response()
+	if err == nil {
+		resp.Body.Close()
+		log.GitLogger.Trace("Trigger hook: %s", reqURL)
+	} else {
+		log.GitLogger.Error(2, "Fail to trigger hook: %v", err)
 	}
-	key.Updated = time.Now()
-	if err = models.UpdatePublicKey(key); err != nil {
-		log.GitLogger.Fatal(2, "UpdatePublicKey: %v", err)
+
+	// Update user key activity.
+	if keyID > 0 {
+		key, err := models.GetPublicKeyByID(keyID)
+		if err != nil {
+			fail("Internal error", "GetPublicKeyById: %v", err)
+		}
+
+		key.Updated = time.Now()
+		if err = models.UpdatePublicKey(key); err != nil {
+			fail("Internal error", "UpdatePublicKey: %v", err)
+		}
 	}
 }

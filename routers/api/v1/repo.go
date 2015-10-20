@@ -5,7 +5,7 @@
 package v1
 
 import (
-	"fmt"
+	"net/url"
 	"path"
 	"strings"
 
@@ -15,7 +15,6 @@ import (
 
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/auth"
-	"github.com/gogits/gogs/modules/base"
 	"github.com/gogits/gogs/modules/log"
 	"github.com/gogits/gogs/modules/middleware"
 	"github.com/gogits/gogs/modules/setting"
@@ -28,7 +27,7 @@ func ToApiRepository(owner *models.User, repo *models.Repository, permission api
 		log.Error(4, "CloneLink: %v", err)
 	}
 	return &api.Repository{
-		Id:          repo.Id,
+		Id:          repo.ID,
 		Owner:       *ToApiUser(owner),
 		FullName:    owner.Name + "/" + repo.Name,
 		Private:     repo.IsPrivate,
@@ -55,7 +54,7 @@ func SearchRepos(ctx *middleware.Context) {
 		if ctx.User.Id == opt.Uid {
 			opt.Private = true
 		} else {
-			u, err := models.GetUserById(opt.Uid)
+			u, err := models.GetUserByID(opt.Uid)
 			if err != nil {
 				ctx.JSON(500, map[string]interface{}{
 					"ok":    false,
@@ -89,7 +88,7 @@ func SearchRepos(ctx *middleware.Context) {
 			return
 		}
 		results[i] = &api.Repository{
-			Id:       repos[i].Id,
+			Id:       repos[i].ID,
 			FullName: path.Join(repos[i].Owner.Name, repos[i].Name),
 		}
 	}
@@ -100,166 +99,190 @@ func SearchRepos(ctx *middleware.Context) {
 	})
 }
 
-func createRepo(ctx *middleware.Context, owner *models.User, opt api.CreateRepoOption) {
-	repo, err := models.CreateRepository(owner, opt.Name, opt.Description,
-		opt.Gitignore, opt.License, opt.Private, false, opt.AutoInit)
+// https://github.com/gogits/go-gogs-client/wiki/Repositories#list-your-repositories
+func ListMyRepos(ctx *middleware.Context) {
+	ownRepos, err := models.GetRepositories(ctx.User.Id, true)
 	if err != nil {
-		if err == models.ErrRepoAlreadyExist ||
-			err == models.ErrRepoNameIllegal {
-			ctx.JSON(422, &base.ApiJsonErr{err.Error(), base.DOC_URL})
+		ctx.APIError(500, "GetRepositories", err)
+		return
+	}
+	numOwnRepos := len(ownRepos)
+
+	accessibleRepos, err := ctx.User.GetAccessibleRepositories()
+	if err != nil {
+		ctx.APIError(500, "GetAccessibleRepositories", err)
+		return
+	}
+
+	repos := make([]*api.Repository, numOwnRepos+len(accessibleRepos))
+	for i := range ownRepos {
+		repos[i] = ToApiRepository(ctx.User, ownRepos[i], api.Permission{true, true, true})
+	}
+	i := numOwnRepos
+
+	for repo, access := range accessibleRepos {
+		repos[i] = ToApiRepository(repo.Owner, repo, api.Permission{
+			Admin: access >= models.ACCESS_MODE_ADMIN,
+			Push:  access >= models.ACCESS_MODE_WRITE,
+			Pull:  true,
+		})
+		i++
+	}
+
+	ctx.JSON(200, &repos)
+}
+
+func createRepo(ctx *middleware.Context, owner *models.User, opt api.CreateRepoOption) {
+	repo, err := models.CreateRepository(owner, models.CreateRepoOptions{
+		Name:        opt.Name,
+		Description: opt.Description,
+		Gitignores:  opt.Gitignores,
+		License:     opt.License,
+		Readme:      opt.Readme,
+		IsPrivate:   opt.Private,
+		AutoInit:    opt.AutoInit,
+	})
+	if err != nil {
+		if models.IsErrRepoAlreadyExist(err) ||
+			models.IsErrNameReserved(err) ||
+			models.IsErrNamePatternNotAllowed(err) {
+			ctx.APIError(422, "", err)
 		} else {
-			log.Error(4, "CreateRepository: %v", err)
 			if repo != nil {
-				if err = models.DeleteRepository(ctx.User.Id, repo.Id, ctx.User.Name); err != nil {
+				if err = models.DeleteRepository(ctx.User.Id, repo.ID); err != nil {
 					log.Error(4, "DeleteRepository: %v", err)
 				}
 			}
-			ctx.Error(500)
+			ctx.APIError(500, "CreateRepository", err)
 		}
 		return
 	}
 
-	ctx.JSON(200, ToApiRepository(owner, repo, api.Permission{true, true, true}))
+	ctx.JSON(201, ToApiRepository(owner, repo, api.Permission{true, true, true}))
 }
 
-// POST /user/repos
-// https://developer.github.com/v3/repos/#create
+// https://github.com/gogits/go-gogs-client/wiki/Repositories#create
 func CreateRepo(ctx *middleware.Context, opt api.CreateRepoOption) {
 	// Shouldn't reach this condition, but just in case.
 	if ctx.User.IsOrganization() {
-		ctx.JSON(422, "not allowed creating repository for organization")
+		ctx.APIError(422, "", "not allowed creating repository for organization")
 		return
 	}
 	createRepo(ctx, ctx.User, opt)
 }
 
-// POST /orgs/:org/repos
-// https://developer.github.com/v3/repos/#create
 func CreateOrgRepo(ctx *middleware.Context, opt api.CreateRepoOption) {
 	org, err := models.GetOrgByName(ctx.Params(":org"))
 	if err != nil {
-		if err == models.ErrUserNotExist {
-			ctx.Error(404)
+		if models.IsErrUserNotExist(err) {
+			ctx.APIError(422, "", err)
 		} else {
-			ctx.Error(500)
+			ctx.APIError(500, "GetOrgByName", err)
 		}
 		return
 	}
 
 	if !org.IsOwnedBy(ctx.User.Id) {
-		ctx.Error(403)
+		ctx.APIError(403, "", "Given user is not owner of organization.")
 		return
 	}
 	createRepo(ctx, org, opt)
 }
 
 func MigrateRepo(ctx *middleware.Context, form auth.MigrateRepoForm) {
-	u, err := models.GetUserByName(ctx.Query("username"))
-	if err != nil {
-		ctx.JSON(500, map[string]interface{}{
-			"ok":    false,
-			"error": err.Error(),
-		})
-		return
-	}
-	if !u.ValidtePassword(ctx.Query("password")) {
-		ctx.JSON(500, map[string]interface{}{
-			"ok":    false,
-			"error": "username or password is not correct",
-		})
-		return
-	}
-
-	ctxUser := u
+	ctxUser := ctx.User
 	// Not equal means current user is an organization.
-	if form.Uid != u.Id {
-		org, err := models.GetUserById(form.Uid)
+	if form.Uid != ctxUser.Id {
+		org, err := models.GetUserByID(form.Uid)
 		if err != nil {
-			log.Error(4, "GetUserById: %v", err)
-			ctx.Error(500)
+			if models.IsErrUserNotExist(err) {
+				ctx.APIError(422, "", err)
+			} else {
+				ctx.APIError(500, "GetUserByID", err)
+			}
 			return
 		}
 		ctxUser = org
 	}
 
 	if ctx.HasError() {
-		ctx.JSON(422, map[string]interface{}{
-			"ok":    false,
-			"error": ctx.GetErrMsg(),
-		})
+		ctx.APIError(422, "", ctx.GetErrMsg())
 		return
 	}
 
 	if ctxUser.IsOrganization() {
 		// Check ownership of organization.
-		if !ctxUser.IsOwnedBy(u.Id) {
-			ctx.JSON(403, map[string]interface{}{
-				"ok":    false,
-				"error": "given user is not owner of organization",
-			})
+		if !ctxUser.IsOwnedBy(ctx.User.Id) {
+			ctx.APIError(403, "", "Given user is not owner of organization.")
 			return
 		}
 	}
 
-	authStr := strings.Replace(fmt.Sprintf("://%s:%s",
-		form.AuthUserName, form.AuthPasswd), "@", "%40", -1)
-	url := strings.Replace(form.HttpsUrl, "://", authStr+"@", 1)
-	repo, err := models.MigrateRepository(ctxUser, form.RepoName, form.Description, form.Private,
-		form.Mirror, url)
-	if err == nil {
-		log.Trace("Repository migrated: %s/%s", ctxUser.Name, form.RepoName)
-		ctx.JSON(200, map[string]interface{}{
-			"ok":   true,
-			"data": "/" + ctxUser.Name + "/" + form.RepoName,
-		})
+	// Remote address can be HTTP/HTTPS/Git URL or local path.
+	remoteAddr := form.CloneAddr
+	if strings.HasPrefix(form.CloneAddr, "http://") ||
+		strings.HasPrefix(form.CloneAddr, "https://") ||
+		strings.HasPrefix(form.CloneAddr, "git://") {
+		u, err := url.Parse(form.CloneAddr)
+		if err != nil {
+			ctx.APIError(422, "", err)
+			return
+		}
+		if len(form.AuthUsername) > 0 || len(form.AuthPassword) > 0 {
+			u.User = url.UserPassword(form.AuthUsername, form.AuthPassword)
+		}
+		remoteAddr = u.String()
+	} else if !com.IsDir(remoteAddr) {
+		ctx.APIError(422, "", "Invalid local path, it does not exist or not a directory.")
 		return
 	}
 
-	if repo != nil {
-		if errDelete := models.DeleteRepository(ctxUser.Id, repo.Id, ctxUser.Name); errDelete != nil {
-			log.Error(4, "DeleteRepository: %v", errDelete)
+	repo, err := models.MigrateRepository(ctxUser, form.RepoName, form.Description, form.Private, form.Mirror, remoteAddr)
+	if err != nil {
+		if repo != nil {
+			if errDelete := models.DeleteRepository(ctxUser.Id, repo.ID); errDelete != nil {
+				log.Error(4, "DeleteRepository: %v", errDelete)
+			}
 		}
+		ctx.APIError(500, "MigrateRepository", err)
+		return
 	}
 
-	ctx.JSON(500, map[string]interface{}{
-		"ok":    false,
-		"error": err.Error(),
-	})
+	log.Trace("Repository migrated: %s/%s", ctxUser.Name, form.RepoName)
+	ctx.JSON(201, ToApiRepository(ctxUser, repo, api.Permission{true, true, true}))
 }
 
-// GET /user/repos
-// https://developer.github.com/v3/repos/#list-your-repositories
-func ListMyRepos(ctx *middleware.Context) {
-	ownRepos, err := models.GetRepositories(ctx.User.Id, true)
+func DeleteRepo(ctx *middleware.Context) {
+	user, err := models.GetUserByName(ctx.Params(":username"))
 	if err != nil {
-		ctx.JSON(500, &base.ApiJsonErr{"GetRepositories: " + err.Error(), base.DOC_URL})
-		return
-	}
-	numOwnRepos := len(ownRepos)
-
-	collaRepos, err := models.GetCollaborativeRepos(ctx.User.Name)
-	if err != nil {
-		ctx.JSON(500, &base.ApiJsonErr{"GetCollaborativeRepos: " + err.Error(), base.DOC_URL})
+		if models.IsErrUserNotExist(err) {
+			ctx.APIError(422, "", err)
+		} else {
+			ctx.APIError(500, "GetUserByName", err)
+		}
 		return
 	}
 
-	repos := make([]*api.Repository, numOwnRepos+len(collaRepos))
-	for i := range ownRepos {
-		repos[i] = ToApiRepository(ctx.User, ownRepos[i], api.Permission{true, true, true})
-	}
-	for i := range collaRepos {
-		if err = collaRepos[i].GetOwner(); err != nil {
-			ctx.JSON(500, &base.ApiJsonErr{"GetOwner: " + err.Error(), base.DOC_URL})
-			return
+	repo, err := models.GetRepositoryByName(user.Id, ctx.Params(":reponame"))
+	if err != nil {
+		if models.IsErrRepoNotExist(err) {
+			ctx.Error(404)
+		} else {
+			ctx.APIError(500, "GetRepositoryByName", err)
 		}
-		j := i + numOwnRepos
-		repos[j] = ToApiRepository(collaRepos[i].Owner, collaRepos[i].Repository, api.Permission{false, collaRepos[i].CanPush, true})
-
-		// FIXME: cache result to reduce DB query?
-		if collaRepos[i].Owner.IsOrganization() && collaRepos[i].Owner.IsOwnedBy(ctx.User.Id) {
-			repos[j].Permissions.Admin = true
-		}
+		return
 	}
 
-	ctx.JSON(200, &repos)
+	if user.IsOrganization() && !user.IsOwnedBy(ctx.User.Id) {
+		ctx.APIError(403, "", "Given user is not owner of organization.")
+		return
+	}
+
+	if err := models.DeleteRepository(user.Id, repo.ID); err != nil {
+		ctx.APIError(500, "DeleteRepository", err)
+		return
+	}
+
+	log.Trace("Repository deleted: %s/%s", user.Name, repo.Name)
+	ctx.Status(204)
 }

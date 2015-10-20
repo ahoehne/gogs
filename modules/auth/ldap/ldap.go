@@ -1,12 +1,13 @@
-// Copyright github.com/juju2013. All rights reserved.
+// Copyright 2014 The Gogs Authors. All rights reserved.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
-// package ldap provide functions & structure to query a LDAP ldap directory
+// Package ldap provide functions & structure to query a LDAP ldap directory
 // For now, it's mainly tested again an MS Active Directory service, see README.md for more information
 package ldap
 
 import (
+	"crypto/tls"
 	"fmt"
 
 	"github.com/gogits/gogs/modules/ldap"
@@ -14,45 +15,25 @@ import (
 )
 
 // Basic LDAP authentication service
-type Ldapsource struct {
-	Name         string // canonical name (ie. corporate.ad)
-	Host         string // LDAP host
-	Port         int    // port number
-	UseSSL       bool   // Use SSL
-	BaseDN       string // Base DN
-	Attributes   string // Attribute to search
-	Filter       string // Query filter to validate entry
-	MsAdSAFormat string // in the case of MS AD Simple Authen, the format to use (see: http://msdn.microsoft.com/en-us/library/cc223499.aspx)
-	Enabled      bool   // if this source is disabled
+type Source struct {
+	Name             string // canonical name (ie. corporate.ad)
+	Host             string // LDAP host
+	Port             int    // port number
+	UseSSL           bool   // Use SSL
+	SkipVerify       bool
+	BindDN           string // DN to bind with
+	BindPassword     string // Bind DN password
+	UserBase         string // Base search path for users
+	UserDN           string // Template for the DN of the user for simple auth
+	AttributeName    string // First name attribute
+	AttributeSurname string // Surname attribute
+	AttributeMail    string // E-mail attribute
+	Filter           string // Query filter to validate entry
+	AdminFilter      string // Query filter to check if user is admin
+	Enabled          bool   // if this source is disabled
 }
 
-//Global LDAP directory pool
-var (
-	Authensource []Ldapsource
-)
-
-// Add a new source (LDAP directory) to the global pool
-func AddSource(name string, host string, port int, usessl bool, basedn string, attributes string, filter string, msadsaformat string) {
-	ldaphost := Ldapsource{name, host, port, usessl, basedn, attributes, filter, msadsaformat, true}
-	Authensource = append(Authensource, ldaphost)
-}
-
-//LoginUser : try to login an user to LDAP sources, return requested (attribute,true) if ok, ("",false) other wise
-//First match wins
-//Returns first attribute if exists
-func LoginUser(name, passwd string) (a string, r bool) {
-	r = false
-	for _, ls := range Authensource {
-		a, r = ls.SearchEntry(name, passwd)
-		if r {
-			return
-		}
-	}
-	return
-}
-
-// searchEntry : search an LDAP source if an entry (name, passwd) is valide and in the specific filter
-func (ls Ldapsource) SearchEntry(name, passwd string) (string, bool) {
+func (ls *Source) FindUserDN(name string) (string, bool) {
 	l, err := ldapDial(ls)
 	if err != nil {
 		log.Error(4, "LDAP Connect error, %s:%v", ls.Host, err)
@@ -61,35 +42,126 @@ func (ls Ldapsource) SearchEntry(name, passwd string) (string, bool) {
 	}
 	defer l.Close()
 
-	nx := fmt.Sprintf(ls.MsAdSAFormat, name)
-	err = l.Bind(nx, passwd)
-	if err != nil {
-		log.Debug("LDAP Authan failed for %s, reason: %s", nx, err.Error())
+	log.Trace("Search for LDAP user: %s", name)
+	if ls.BindDN != "" && ls.BindPassword != "" {
+		err = l.Bind(ls.BindDN, ls.BindPassword)
+		if err != nil {
+			log.Debug("Failed to bind as BindDN[%s]: %v", ls.BindDN, err)
+			return "", false
+		}
+		log.Trace("Bound as BindDN %s", ls.BindDN)
+	} else {
+		log.Trace("Proceeding with anonymous LDAP search.")
+	}
+
+	// A search for the user.
+	userFilter := fmt.Sprintf(ls.Filter, name)
+	log.Trace("Searching using filter %s", userFilter)
+	search := ldap.NewSearchRequest(
+		ls.UserBase, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0,
+		false, userFilter, []string{}, nil)
+
+	// Ensure we found a user
+	sr, err := l.Search(search)
+	if err != nil || len(sr.Entries) < 1 {
+		log.Debug("Failed search using filter[%s]: %v", userFilter, err)
+		return "", false
+	} else if len(sr.Entries) > 1 {
+		log.Debug("Filter '%s' returned more than one user.", userFilter)
 		return "", false
 	}
 
-	search := ldap.NewSearchRequest(
-		ls.BaseDN,
-		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
-		fmt.Sprintf(ls.Filter, name),
-		[]string{ls.Attributes},
-		nil)
-	sr, err := l.Search(search)
-	if err != nil {
-		log.Debug("LDAP Authen OK but not in filter %s", name)
+	userDN := sr.Entries[0].DN
+	if userDN == "" {
+		log.Error(4, "LDAP search was succesful, but found no DN!")
 		return "", false
 	}
-	log.Debug("LDAP Authen OK: %s", name)
-	if len(sr.Entries) > 0 {
-		r := sr.Entries[0].GetAttributeValue(ls.Attributes)
-		return r, true
-	}
-	return "", true
+
+	return userDN, true
 }
 
-func ldapDial(ls Ldapsource) (*ldap.Conn, error) {
+// searchEntry : search an LDAP source if an entry (name, passwd) is valid and in the specific filter
+func (ls *Source) SearchEntry(name, passwd string, directBind bool) (string, string, string, bool, bool) {
+	var userDN string
+	if directBind {
+		log.Trace("LDAP will bind directly via UserDN template: %s", ls.UserDN)
+		userDN = fmt.Sprintf(ls.UserDN, name)
+	} else {
+		log.Trace("LDAP will use BindDN.")
+
+		var found bool
+		userDN, found = ls.FindUserDN(name)
+		if !found {
+			return "", "", "", false, false
+		}
+	}
+
+	l, err := ldapDial(ls)
+	if err != nil {
+		log.Error(4, "LDAP Connect error, %s:%v", ls.Host, err)
+		ls.Enabled = false
+		return "", "", "", false, false
+	}
+	defer l.Close()
+
+	log.Trace("Binding with userDN: %s", userDN)
+	err = l.Bind(userDN, passwd)
+	if err != nil {
+		log.Debug("LDAP auth. failed for %s, reason: %v", userDN, err)
+		return "", "", "", false, false
+	}
+
+	log.Trace("Bound successfully with userDN: %s", userDN)
+	userFilter := fmt.Sprintf(ls.Filter, name)
+	search := ldap.NewSearchRequest(
+		userDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, userFilter,
+		[]string{ls.AttributeName, ls.AttributeSurname, ls.AttributeMail},
+		nil)
+
+	sr, err := l.Search(search)
+	if err != nil {
+		log.Error(4, "LDAP Search failed unexpectedly! (%v)", err)
+		return "", "", "", false, false
+	} else if len(sr.Entries) < 1 {
+		if directBind {
+			log.Error(4, "User filter inhibited user login.")
+		} else {
+			log.Error(4, "LDAP Search failed unexpectedly! (0 entries)")
+		}
+
+		return "", "", "", false, false
+	}
+
+	name_attr := sr.Entries[0].GetAttributeValue(ls.AttributeName)
+	sn_attr := sr.Entries[0].GetAttributeValue(ls.AttributeSurname)
+	mail_attr := sr.Entries[0].GetAttributeValue(ls.AttributeMail)
+
+	admin_attr := false
+	if len(ls.AdminFilter) > 0 {
+		search = ldap.NewSearchRequest(
+			userDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, ls.AdminFilter,
+			[]string{ls.AttributeName},
+			nil)
+
+		sr, err = l.Search(search)
+		if err != nil {
+			log.Error(4, "LDAP Admin Search failed unexpectedly! (%v)", err)
+		} else if len(sr.Entries) < 1 {
+			log.Error(4, "LDAP Admin Search failed")
+		} else {
+			admin_attr = true
+		}
+	}
+
+	return name_attr, sn_attr, mail_attr, admin_attr, true
+}
+
+func ldapDial(ls *Source) (*ldap.Conn, error) {
 	if ls.UseSSL {
-		return ldap.DialTLS("tcp", fmt.Sprintf("%s:%d", ls.Host, ls.Port), nil)
+		log.Debug("Using TLS for LDAP without verifying: %v", ls.SkipVerify)
+		return ldap.DialTLS("tcp", fmt.Sprintf("%s:%d", ls.Host, ls.Port), &tls.Config{
+			InsecureSkipVerify: ls.SkipVerify,
+		})
 	} else {
 		return ldap.Dial("tcp", fmt.Sprintf("%s:%d", ls.Host, ls.Port))
 	}

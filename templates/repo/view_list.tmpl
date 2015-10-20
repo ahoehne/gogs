@@ -39,14 +39,18 @@
                     <span class="octicon octicon-file-submodule"></span>
                 </td>
                 <td class="name">
+                    {{if $commit.RefUrl}}
                     <a href="{{$commit.RefUrl}}" class="text-truncate">{{$entry.Name}}</a> @ <a href="{{$commit.RefUrl}}/commit/{{$commit.RefId}}">{{ShortSha $commit.RefId}}</a>
+                    {{else}}
+                    {{$entry.Name}} @ {{ShortSha $commit.RefId}}
+                    {{end}}
                 </td>
             {{else}}
             <td class="icon">
                     <span class="octicon octicon-file-{{if or $entry.IsDir}}directory{{else}}text{{end}}"></span>
                 </td>
                 <td class="name">
-                    <a href="{{EscapePound $.BranchLink}}/{{$.TreePath}}{{$entry.Name}}" class="text-truncate">{{$entry.Name}}</a>
+                    <a href="{{EscapePound $.BranchLink}}/{{EscapePound $.TreePath}}{{EscapePound $entry.Name}}" class="text-truncate">{{$entry.Name}}</a>
                 </td>
                 {{end}}
                 <td class="sha">

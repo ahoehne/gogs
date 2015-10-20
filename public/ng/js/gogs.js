@@ -57,10 +57,10 @@ var Gogs = {};
     });
     $.fn.extend({
         toggleHide: function () {
-            $(this).addClass("hidden");
+            $(this).each(function(n, v) { $(v).addClass("hidden"); });
         },
         toggleShow: function () {
-            $(this).removeClass("hidden");
+            $(this).each(function(n, v) { $(v).removeClass("hidden"); });
         },
         toggleAjax: function (successCallback, errorCallback) {
             var url = $(this).data("ajax");
@@ -209,27 +209,28 @@ var Gogs = {};
             $list.parents('tr').removeClass('end-selected-line');
             $list.parents('tr').find('td').removeClass('selected-line');
             if ($from) {
-                var expr = new RegExp(/diff-(\d+)L(\d+)/);
+                var expr = new RegExp(/diff-(\w+)([LR]\d+)/);
                 var selectMatches = $select.attr('rel').match(expr)
                 var fromMatches = $from.attr('rel').match(expr)
-                var a = parseInt(selectMatches[2]);
-                var b = parseInt(fromMatches[2]);
-                var linesIntToStr = {};
-                linesIntToStr[a] = selectMatches[2];
-                linesIntToStr[b] = fromMatches[2];
+                var selectTop = $select.offset().top;
+                var fromTop = $from.offset().top;
+                var hash;
 
-                var c;
-                if (a != b) {
-                    if (a > b) {
-                        c = a;
-                        a = b;
-                        b = c;
+                if (selectMatches[2] != fromMatches[2]) {
+                    if ((selectTop > fromTop)) {
+                        $startElem = $from;
+                        $endElem = $select;
+                        hash = fromMatches[1]+fromMatches[2] + '-' + selectMatches[2];
+                    } else {
+                        $startElem = $select;
+                        $endElem = $from;
+                        hash = selectMatches[1]+selectMatches[2] + '-' + fromMatches[2];
                     }
-                    $('[rel=diff-'+fromMatches[1]+'L' + linesIntToStr[b] + ']').parents('tr').next().addClass('end-selected-line');
-                    var $selectedLines = $('[rel=diff-'+fromMatches[1]+'L' + linesIntToStr[a] + ']').parents('tr').nextUntil('.end-selected-line').andSelf();
+                    $endElem.parents('tr').next().addClass('end-selected-line');
+                    var $selectedLines = $startElem.parents('tr').nextUntil('.end-selected-line').andSelf();
                     $selectedLines.find('td.lines-num > span').addClass('active')
                     $selectedLines.find('td').addClass('selected-line');
-                    $.changeHash('#diff-'+fromMatches[1]+'L' + linesIntToStr[a] + '-L' + linesIntToStr[b]);
+                    $.changeHash('#diff-'+hash);
                     return
                 }
             }
@@ -262,7 +263,7 @@ var Gogs = {};
         });
 
         $(window).on('hashchange', function (e) {
-            var m = window.location.hash.match(/^#diff-(\d+)(L\d+)\-(L\d+)$/);
+            var m = window.location.hash.match(/^#diff-(\w+)([LR]\d+)\-([LR]\d+)$/);
             var $list = $('.code-diff td.lines-num > span');
             var $first;
             if (m) {
@@ -271,7 +272,7 @@ var Gogs = {};
                 $("html, body").scrollTop($first.offset().top - 200);
                 return;
             }
-            m = window.location.hash.match(/^#diff-(\d+)(L\d+)$/);
+            m = window.location.hash.match(/^#diff-(\w+)([LR]\d+)$/);
             if (m) {
                 $first = $list.filter('[rel=diff-' + m[1] + m[2] + ']');
                 selectRange($list, $first);
@@ -332,25 +333,17 @@ var Gogs = {};
         if ($(selector).hasClass('js-copy-bind')) {
             return;
         }
-        $(selector).zclip({
-            path: Gogs.AppSubUrl + "/js/ZeroClipboard.swf",
-            copy: function () {
-                var t = $(this).data("copy-val");
-                var to = $($(this).data("copy-from"));
-                var str = "";
-                if (t == "txt") {
-                    str = to.text();
-                }
-                if (t == 'val') {
-                    str = to.val();
-                }
-                if (t == 'html') {
-                    str = to.html();
-                }
-                return str;
-            },
-            afterCopy: function () {
+
+        if ( document.documentElement.classList.contains("is-copy-enabled") ) {
+
+            $(selector).click(function(event) {
                 var $this = $(this);
+
+                var cfrom = $this.attr('data-copy-from');
+                $(cfrom).select();
+                document.execCommand('copy');
+                getSelection().removeAllRanges();
+
                 $this.tipsy("hide").attr('original-title', $this.data('after-title'));
                 setTimeout(function () {
                     $this.tipsy("show");
@@ -358,8 +351,44 @@ var Gogs = {};
                 setTimeout(function () {
                     $this.tipsy('hide').attr('original-title', $this.data('original-title'));
                 }, 2000);
-            }
-        }).addClass("js-copy-bind");
+                
+                this.blur();
+                return;
+            });
+
+            $(selector).addClass("js-copy-bind");
+
+        } else {
+
+            $(selector).zclip({
+                path: Gogs.AppSubUrl + "/js/ZeroClipboard.swf",
+                copy: function () {
+                    var t = $(this).data("copy-val");
+                    var to = $($(this).data("copy-from"));
+                    var str = "";
+                    if (t == "txt") {
+                        str = to.text();
+                    }
+                    if (t == 'val') {
+                        str = to.val();
+                    }
+                    if (t == 'html') {
+                        str = to.html();
+                    }
+                    return str;
+                },
+                afterCopy: function () {
+                    var $this = $(this);
+                    $this.tipsy("hide").attr('original-title', $this.data('after-title'));
+                    setTimeout(function () {
+                        $this.tipsy("show");
+                    }, 200);
+                    setTimeout(function () {
+                        $this.tipsy('hide').attr('original-title', $this.data('original-title'));
+                    }, 2000);
+                }
+            }).addClass("js-copy-bind");
+        }
     }
 })(jQuery);
 
@@ -746,17 +775,20 @@ function initAdmin() {
         $form.attr('action', $form.data('delete-url'));
     });
 
-    // Create authorization.
+    // Create authorization. Keep list in sync with models/login.go.
+    var all_auths = ['none', 'plain', 'ldap', 'dldap', 'smtp', 'pam'];
     $('#auth-type').on("change", function () {
         var v = $(this).val();
-        if (v == 2) {
-            $('.ldap').toggleShow();
-            $('.smtp').toggleHide();
-        }
-        if (v == 3) {
-            $('.smtp').toggleShow();
-            $('.ldap').toggleHide();
-        }
+        if (v >= all_auths.length) return;
+
+        // Hide all through their class names.
+        $.each(all_auths, function(i, type) {
+          $('.' + type).toggleHide();
+        });
+
+        // Show the selected one.
+        var selected = all_auths[v];
+        $('.' + selected).toggleShow();
     });
 
     // Delete authorization.
@@ -900,6 +932,10 @@ $(document).ready(function () {
     $('#pull-issue-preview').markdown_preview(".issue-add-comment");
 
     homepage();
+    emojify.setConfig({
+        img_dir: Gogs.AppSubUrl + '/img/emoji'
+    });
+    emojify.run();
 
     // Fix language drop-down menu height.
     var l = $('#footer-lang li').length;

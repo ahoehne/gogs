@@ -5,8 +5,8 @@
 package auth
 
 import (
-	"github.com/Unknwon/macaron"
-	"github.com/macaron-contrib/binding"
+	"github.com/go-macaron/binding"
+	"gopkg.in/macaron.v1"
 )
 
 // _______________________________________    _________.______________________ _______________.___.
@@ -17,13 +17,14 @@ import (
 //         \/        \/                   \/        \/                        \/       \/ \/
 
 type CreateRepoForm struct {
-	Uid         int64  `form:"uid" binding:"Required"`
-	RepoName    string `form:"repo_name" binding:"Required;AlphaDashDot;MaxSize(100)"`
-	Private     bool   `form:"private"`
-	Description string `form:"desc" binding:"MaxSize(255)"`
-	AutoInit    bool   `form:"auto_init"`
-	Gitignore   string `form:"gitignore"`
-	License     string `form:"license"`
+	Uid         int64  `binding:"Required"`
+	RepoName    string `binding:"Required;AlphaDashDot;MaxSize(100)"`
+	Private     bool
+	Description string `binding:"MaxSize(255)"`
+	AutoInit    bool
+	Gitignores  string
+	License     string
+	Readme      string
 }
 
 func (f *CreateRepoForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
@@ -31,14 +32,14 @@ func (f *CreateRepoForm) Validate(ctx *macaron.Context, errs binding.Errors) bin
 }
 
 type MigrateRepoForm struct {
-	HttpsUrl     string `form:"url" binding:"Required;Url"`
-	AuthUserName string `form:"auth_username"`
-	AuthPasswd   string `form:"auth_password"`
-	Uid          int64  `form:"uid" binding:"Required"`
-	RepoName     string `form:"repo_name" binding:"Required;AlphaDashDot;MaxSize(100)"`
-	Mirror       bool   `form:"mirror"`
-	Private      bool   `form:"private"`
-	Description  string `form:"desc" binding:"MaxSize(255)"`
+	CloneAddr    string `json:"clone_addr" binding:"Required"`
+	AuthUsername string `json:"auth_username"`
+	AuthPassword string `json:"auth_password"`
+	Uid          int64  `json:"uid" binding:"Required"`
+	RepoName     string `json:"repo_name" binding:"Required;AlphaDashDot;MaxSize(100)"`
+	Private      bool   `json:"mirror"`
+	Mirror       bool   `json:"private"`
+	Description  string `json:"description" binding:"MaxSize(255)"`
 }
 
 func (f *MigrateRepoForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
@@ -46,13 +47,12 @@ func (f *MigrateRepoForm) Validate(ctx *macaron.Context, errs binding.Errors) bi
 }
 
 type RepoSettingForm struct {
-	RepoName    string `form:"repo_name" binding:"Required;AlphaDashDot;MaxSize(100)"`
-	Description string `form:"desc" binding:"MaxSize(255)"`
-	Website     string `form:"site" binding:"Url;MaxSize(100)"`
-	Branch      string `form:"branch"`
-	Interval    int    `form:"interval"`
-	Private     bool   `form:"private"`
-	GoGet       bool   `form:"goget"`
+	RepoName    string `binding:"Required;AlphaDashDot;MaxSize(100)"`
+	Description string `binding:"MaxSize(255)"`
+	Website     string `binding:"Url;MaxSize(100)"`
+	Branch      string
+	Interval    int
+	Private     bool
 }
 
 func (f *RepoSettingForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
@@ -66,13 +66,30 @@ func (f *RepoSettingForm) Validate(ctx *macaron.Context, errs binding.Errors) bi
 //   \__/\  /  \___  >___  /___|  /___|  /\____/|__|_ \
 //        \/       \/    \/     \/     \/            \/
 
+type WebhookForm struct {
+	Events string
+	Create bool
+	Push   bool
+	Active bool
+}
+
+func (f WebhookForm) PushOnly() bool {
+	return f.Events == "push_only"
+}
+
+func (f WebhookForm) SendEverything() bool {
+	return f.Events == "send_everything"
+}
+
+func (f WebhookForm) ChooseEvents() bool {
+	return f.Events == "choose_events"
+}
+
 type NewWebhookForm struct {
-	HookTaskType string `form:"hook_type" binding:"Required"`
-	PayloadUrl   string `form:"payload_url" binding:"Required;Url"`
-	ContentType  string `form:"content_type" binding:"Required"`
-	Secret       string `form:"secret"`
-	PushOnly     bool   `form:"push_only"`
-	Active       bool   `form:"active"`
+	PayloadURL  string `binding:"Required;Url"`
+	ContentType int    `binding:"Required"`
+	Secret      string
+	WebhookForm
 }
 
 func (f *NewWebhookForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
@@ -80,11 +97,12 @@ func (f *NewWebhookForm) Validate(ctx *macaron.Context, errs binding.Errors) bin
 }
 
 type NewSlackHookForm struct {
-	HookTaskType string `form:"hook_type" binding:"Required"`
-	PayloadUrl   string `form:"payload_url" binding:"Required`
-	Channel      string `form:"channel" binding:"Required"`
-	PushOnly     bool   `form:"push_only"`
-	Active       bool   `form:"active"`
+	PayloadURL string `binding:"Required;Url`
+	Channel    string `binding:"Required"`
+	Username   string
+	IconURL    string
+	Color      string
+	WebhookForm
 }
 
 func (f *NewSlackHookForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
@@ -99,14 +117,25 @@ func (f *NewSlackHookForm) Validate(ctx *macaron.Context, errs binding.Errors) b
 //          \/     \/            \/
 
 type CreateIssueForm struct {
-	IssueName   string `form:"title" binding:"Required;MaxSize(255)"`
-	MilestoneId int64  `form:"milestoneid"`
-	AssigneeId  int64  `form:"assigneeid"`
-	Labels      string `form:"labels"`
-	Content     string `form:"content"`
+	Title       string `binding:"Required;MaxSize(255)"`
+	LabelIDs    string `form:"label_ids"`
+	MilestoneID int64
+	AssigneeID  int64
+	Content     string
+	Attachments []string
 }
 
 func (f *CreateIssueForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
+	return validate(errs, ctx.Data, f, ctx.Locale)
+}
+
+type CreateCommentForm struct {
+	Content     string
+	Status      string `binding:"OmitEmpty;In(reopen,close)"`
+	Attachments []string
+}
+
+func (f *CreateCommentForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
 	return validate(errs, ctx.Data, f, ctx.Locale)
 }
 
@@ -118,9 +147,9 @@ func (f *CreateIssueForm) Validate(ctx *macaron.Context, errs binding.Errors) bi
 //         \/             \/     \/                   \/     \/
 
 type CreateMilestoneForm struct {
-	Title    string `form:"title" binding:"Required;MaxSize(50)"`
-	Content  string `form:"content"`
-	Deadline string `form:"due_date"`
+	Title    string `binding:"Required;MaxSize(50)"`
+	Content  string
+	Deadline string
 }
 
 func (f *CreateMilestoneForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
@@ -135,8 +164,9 @@ func (f *CreateMilestoneForm) Validate(ctx *macaron.Context, errs binding.Errors
 //         \/    \/    \/     \/
 
 type CreateLabelForm struct {
-	Title string `form:"title" binding:"Required;MaxSize(50)"`
-	Color string `form:"color" binding:"Required;Size(7)"`
+	ID    int64
+	Title string `binding:"Required;MaxSize(50)" locale:"repo.issues.label_name"`
+	Color string `binding:"Required;Size(7)" locale:"repo.issues.label_color"`
 }
 
 func (f *CreateLabelForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
