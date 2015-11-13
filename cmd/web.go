@@ -80,13 +80,13 @@ func checkVersion() {
 
 	// Check dependency version.
 	checkers := []VerChecker{
-		{"github.com/go-xorm/xorm", func() string { return xorm.Version }, "0.4.3.0806"},
+		{"github.com/go-xorm/xorm", func() string { return xorm.Version }, "0.4.4.1029"},
 		{"github.com/Unknwon/macaron", macaron.Version, "0.5.4"},
-		{"github.com/macaron-contrib/binding", binding.Version, "0.1.0"},
-		{"github.com/macaron-contrib/cache", cache.Version, "0.1.2"},
-		{"github.com/macaron-contrib/csrf", csrf.Version, "0.0.3"},
-		{"github.com/macaron-contrib/i18n", i18n.Version, "0.0.7"},
-		{"github.com/macaron-contrib/session", session.Version, "0.1.6"},
+		{"github.com/go-macaron/binding", binding.Version, "0.1.0"},
+		{"github.com/go-macaron/cache", cache.Version, "0.1.2"},
+		{"github.com/go-macaron/csrf", csrf.Version, "0.0.3"},
+		{"github.com/go-macaron/i18n", i18n.Version, "0.0.7"},
+		{"github.com/go-macaron/session", session.Version, "0.1.6"},
 		{"gopkg.in/ini.v1", ini.Version, "1.3.4"},
 	}
 	for _, c := range checkers {
@@ -224,11 +224,12 @@ func runWeb(ctx *cli.Context) {
 
 			m.Group("/repos", func() {
 				m.Get("/search", v1.SearchRepos)
+			})
 
-				m.Group("", func() {
-					m.Post("/migrate", bindIgnErr(auth.MigrateRepoForm{}), v1.MigrateRepo)
-					m.Delete("/:username/:reponame", v1.DeleteRepo)
-				}, middleware.ApiReqToken())
+			m.Group("/repos", func() {
+				m.Post("/migrate", bindIgnErr(auth.MigrateRepoForm{}), v1.MigrateRepo)
+				m.Combo("/:username/:reponame").Get(v1.GetRepo).
+					Delete(v1.DeleteRepo)
 
 				m.Group("/:username/:reponame", func() {
 					m.Combo("/hooks").Get(v1.ListRepoHooks).
@@ -236,8 +237,8 @@ func runWeb(ctx *cli.Context) {
 					m.Patch("/hooks/:id:int", bind(api.EditHookOption{}), v1.EditRepoHook)
 					m.Get("/raw/*", middleware.RepoRef(), v1.GetRepoRawFile)
 					m.Get("/archive/*", v1.GetRepoArchive)
-				}, middleware.ApiRepoAssignment(), middleware.ApiReqToken())
-			})
+				}, middleware.ApiRepoAssignment())
+			}, middleware.ApiReqToken())
 
 			m.Any("/*", func(ctx *middleware.Context) {
 				ctx.Error(404)
@@ -544,8 +545,8 @@ func runWeb(ctx *cli.Context) {
 		}, ignSignIn, middleware.RepoAssignment(true, true), middleware.RepoRef())
 
 		m.Group("/:reponame", func() {
-			m.Any("/*", ignSignInAndCsrf, repo.Http)
-			m.Head("/hooks/trigger", repo.TriggerHook)
+			m.Any("/*", ignSignInAndCsrf, repo.HTTP)
+			m.Head("/tasks/trigger", repo.TriggerTask)
 		})
 	})
 	// ***** END: Repository *****

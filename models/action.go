@@ -147,7 +147,7 @@ func newRepoAction(e Engine, u *User, repo *Repository) (err error) {
 		RepoName:     repo.Name,
 		IsPrivate:    repo.IsPrivate,
 	}); err != nil {
-		return fmt.Errorf("notify watchers '%d/%s': %v", u.Id, repo.ID, err)
+		return fmt.Errorf("notify watchers '%d/%d': %v", u.Id, repo.ID, err)
 	}
 
 	log.Trace("action.newRepoAction: %s/%s", u.Name, repo.Name)
@@ -337,6 +337,12 @@ func CommitRepoAction(
 		return fmt.Errorf("GetOwner: %v", err)
 	}
 
+	// Change repository bare status and update last updated time.
+	repo.IsBare = false
+	if err = UpdateRepository(repo, false); err != nil {
+		return fmt.Errorf("UpdateRepository: %v", err)
+	}
+
 	isNewBranch := false
 	opType := COMMIT_REPO
 	// Check it's tag push or branch.
@@ -349,12 +355,6 @@ func CommitRepoAction(
 			commit.CompareUrl = fmt.Sprintf("%s/%s/compare/%s...%s", repoUserName, repoName, oldCommitID, newCommitID)
 		} else {
 			isNewBranch = true
-		}
-
-		// Change repository bare status and update last updated time.
-		repo.IsBare = false
-		if err = UpdateRepository(repo, false); err != nil {
-			return fmt.Errorf("UpdateRepository: %v", err)
 		}
 
 		if err = updateIssuesCommit(u, repo, repoUserName, repoName, commit.Commits); err != nil {
@@ -488,7 +488,7 @@ func transferRepoAction(e Engine, actUser, oldOwner, newOwner *User, repo *Repos
 		IsPrivate:    repo.IsPrivate,
 		Content:      path.Join(oldOwner.LowerName, repo.LowerName),
 	}); err != nil {
-		return fmt.Errorf("notify watchers '%d/%s': %v", actUser.Id, repo.ID, err)
+		return fmt.Errorf("notify watchers '%d/%d': %v", actUser.Id, repo.ID, err)
 	}
 
 	// Remove watch for organization.

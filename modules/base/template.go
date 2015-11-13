@@ -59,8 +59,8 @@ func ShortSha(sha1 string) string {
 func DetectEncoding(content []byte) (string, error) {
 	detector := chardet.NewTextDetector()
 	result, err := detector.DetectBest(content)
-	if result.Charset != "UTF-8" && len(setting.AnsiCharset) > 0 {
-		return setting.AnsiCharset, err
+	if result.Charset != "UTF-8" && len(setting.Repository.AnsiCharset) > 0 {
+		return setting.Repository.AnsiCharset, err
 	}
 	return result.Charset, err
 }
@@ -263,7 +263,7 @@ func ActionContent2Commits(act Actioner) *PushCommits {
 
 func DiffTypeToStr(diffType int) string {
 	diffTypes := map[int]string{
-		1: "add", 2: "modify", 3: "del",
+		1: "add", 2: "modify", 3: "del", 4: "rename",
 	}
 	return diffTypes[diffType]
 }

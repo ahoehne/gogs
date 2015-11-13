@@ -71,13 +71,14 @@ type User struct {
 	Created     time.Time `xorm:"CREATED"`
 	Updated     time.Time `xorm:"UPDATED"`
 
-	// Remember visibility choice for convenience.
+	// Remember visibility choice for convenience, true for private
 	LastRepoVisibility bool
 
 	// Permissions.
-	IsActive     bool
-	IsAdmin      bool
-	AllowGitHook bool
+	IsActive         bool
+	IsAdmin          bool
+	AllowGitHook     bool
+	AllowImportLocal bool // Allow migrate repository by local path
 
 	// Avatar.
 	Avatar          string `xorm:"VARCHAR(2048) NOT NULL"`
@@ -105,6 +106,16 @@ func (u *User) AfterSet(colName string, _ xorm.Cell) {
 	case "created":
 		u.Created = regulateTimeZone(u.Created)
 	}
+}
+
+// CanEditGitHook returns true if user can edit Git hooks.
+func (u *User) CanEditGitHook() bool {
+	return u.IsAdmin || u.AllowGitHook
+}
+
+// CanImportLocal returns true if user can migrate repository by local path.
+func (u *User) CanImportLocal() bool {
+	return u.IsAdmin || u.AllowImportLocal
 }
 
 // EmailAdresses is the list of all email addresses of a user. Can contain the
@@ -717,9 +728,9 @@ func UserPath(userName string) string {
 	return filepath.Join(setting.RepoRootPath, strings.ToLower(userName))
 }
 
-func GetUserByKeyId(keyId int64) (*User, error) {
+func GetUserByKeyID(keyID int64) (*User, error) {
 	user := new(User)
-	has, err := x.Sql("SELECT a.* FROM `user` AS a, public_key AS b WHERE a.id = b.owner_id AND b.id=?", keyId).Get(user)
+	has, err := x.Sql("SELECT a.* FROM `user` AS a, public_key AS b WHERE a.id = b.owner_id AND b.id=?", keyID).Get(user)
 	if err != nil {
 		return nil, err
 	} else if !has {

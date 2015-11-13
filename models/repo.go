@@ -23,6 +23,7 @@ import (
 	"github.com/Unknwon/cae/zip"
 	"github.com/Unknwon/com"
 	"github.com/go-xorm/xorm"
+	"gopkg.in/ini.v1"
 
 	"github.com/gogits/gogs/modules/base"
 	"github.com/gogits/gogs/modules/bindata"
@@ -183,9 +184,11 @@ func (repo *Repository) AfterSet(colName string, _ xorm.Cell) {
 }
 
 func (repo *Repository) getOwner(e Engine) (err error) {
-	if repo.Owner == nil {
-		repo.Owner, err = getUserByID(e, repo.OwnerID)
+	if repo.Owner != nil {
+		return nil
 	}
+
+	repo.Owner, err = getUserByID(e, repo.OwnerID)
 	return err
 }
 
@@ -298,7 +301,7 @@ func (repo *Repository) DescriptionHtml() template.HTML {
 }
 
 func (repo *Repository) LocalCopyPath() string {
-	return path.Join(setting.RepoRootPath, "local", com.ToStr(repo.ID))
+	return path.Join(setting.AppDataPath, "tmp/local", com.ToStr(repo.ID))
 }
 
 // UpdateLocalCopy makes sure the local copy of repository is up-to-date.
@@ -321,6 +324,30 @@ func (repo *Repository) UpdateLocalCopy() error {
 		if err != nil {
 			return fmt.Errorf("git pull: %v - %s", err, stderr)
 		}
+	}
+
+	return nil
+}
+
+// PatchPath returns corresponding patch file path of repository by given issue ID.
+func (repo *Repository) PatchPath(index int64) (string, error) {
+	if err := repo.GetOwner(); err != nil {
+		return "", err
+	}
+
+	return filepath.Join(RepoPath(repo.Owner.Name, repo.Name), "pulls", com.ToStr(index)+".patch"), nil
+}
+
+// SavePatch saves patch data to corresponding location by given issue ID.
+func (repo *Repository) SavePatch(index int64, patch []byte) error {
+	patchPath, err := repo.PatchPath(index)
+	if err != nil {
+		return fmt.Errorf("PatchPath: %v", err)
+	}
+
+	os.MkdirAll(path.Dir(patchPath), os.ModePerm)
+	if err = ioutil.WriteFile(patchPath, patch, 0644); err != nil {
+		return fmt.Errorf("WriteFile: %v", err)
 	}
 
 	return nil
@@ -353,11 +380,11 @@ func (repo *Repository) CloneLink() (cl CloneLink, err error) {
 	}
 
 	if setting.SSHPort != 22 {
-		cl.SSH = fmt.Sprintf("ssh://%s@%s:%d/%s/%s.git", setting.RunUser, setting.SSHDomain, setting.SSHPort, repo.Owner.LowerName, repo.LowerName)
+		cl.SSH = fmt.Sprintf("ssh://%s@%s:%d/%s/%s.git", setting.RunUser, setting.SSHDomain, setting.SSHPort, repo.Owner.Name, repo.Name)
 	} else {
-		cl.SSH = fmt.Sprintf("%s@%s:%s/%s.git", setting.RunUser, setting.SSHDomain, repo.Owner.LowerName, repo.LowerName)
+		cl.SSH = fmt.Sprintf("%s@%s:%s/%s.git", setting.RunUser, setting.SSHDomain, repo.Owner.Name, repo.Name)
 	}
-	cl.HTTPS = fmt.Sprintf("%s%s/%s.git", setting.AppUrl, repo.Owner.LowerName, repo.LowerName)
+	cl.HTTPS = fmt.Sprintf("%s%s/%s.git", setting.AppUrl, repo.Owner.Name, repo.Name)
 	return cl, nil
 }
 
@@ -454,13 +481,21 @@ func MirrorRepository(repoId int64, userName, repoName, repoPath, url string) er
 	return nil
 }
 
+type MigrateRepoOptions struct {
+	Name        string
+	Description string
+	IsPrivate   bool
+	IsMirror    bool
+	RemoteAddr  string
+}
+
 // MigrateRepository migrates a existing repository from other project hosting.
-func MigrateRepository(u *User, name, desc string, private, mirror bool, url string) (*Repository, error) {
+func MigrateRepository(u *User, opts MigrateRepoOptions) (*Repository, error) {
 	repo, err := CreateRepository(u, CreateRepoOptions{
-		Name:        name,
-		Description: desc,
-		IsPrivate:   private,
-		IsMirror:    mirror,
+		Name:        opts.Name,
+		Description: opts.Description,
+		IsPrivate:   opts.IsPrivate,
+		IsMirror:    opts.IsMirror,
 	})
 	if err != nil {
 		return nil, err
@@ -470,7 +505,7 @@ func MigrateRepository(u *User, name, desc string, private, mirror bool, url str
 	tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("%d", time.Now().Nanosecond()))
 	os.MkdirAll(tmpDir, os.ModePerm)
 
-	repoPath := RepoPath(u.Name, name)
+	repoPath := RepoPath(u.Name, opts.Name)
 
 	if u.IsOrganization() {
 		t, err := u.GetOwnerTeam()
@@ -483,8 +518,8 @@ func MigrateRepository(u *User, name, desc string, private, mirror bool, url str
 	}
 
 	repo.IsBare = false
-	if mirror {
-		if err = MirrorRepository(repo.ID, u.Name, repo.Name, repoPath, url); err != nil {
+	if opts.IsMirror {
+		if err = MirrorRepository(repo.ID, u.Name, repo.Name, repoPath, opts.RemoteAddr); err != nil {
 			return repo, err
 		}
 		repo.IsMirror = true
@@ -496,11 +531,22 @@ func MigrateRepository(u *User, name, desc string, private, mirror bool, url str
 	// FIXME: this command could for both migrate and mirror
 	_, stderr, err := process.ExecTimeout(10*time.Minute,
 		fmt.Sprintf("MigrateRepository: %s", repoPath),
-		"git", "clone", "--mirror", "--bare", "--quiet", url, repoPath)
+		"git", "clone", "--mirror", "--bare", "--quiet", opts.RemoteAddr, repoPath)
 	if err != nil {
 		return repo, fmt.Errorf("git clone --mirror --bare --quiet: %v", stderr)
 	} else if err = createUpdateHook(repoPath); err != nil {
 		return repo, fmt.Errorf("create update hook: %v", err)
+	}
+
+	// Clean up mirror info which prevents "push --all".
+	configPath := filepath.Join(repoPath, "/config")
+	cfg, err := ini.Load(configPath)
+	if err != nil {
+		return repo, fmt.Errorf("open config file: %v", err)
+	}
+	cfg.DeleteSection("remote \"origin\"")
+	if err = cfg.SaveToIndent(configPath, "\t"); err != nil {
+		return repo, fmt.Errorf("save config file: %v", err)
 	}
 
 	// Check if repository is empty.
@@ -553,7 +599,7 @@ func createUpdateHook(repoPath string) error {
 	hookPath := path.Join(repoPath, "hooks/update")
 	os.MkdirAll(path.Dir(hookPath), os.ModePerm)
 	return ioutil.WriteFile(hookPath,
-		[]byte(fmt.Sprintf(_TPL_UPDATE_HOOK, setting.ScriptType, "\""+appPath+"\"", setting.CustomConf)), 0777)
+		[]byte(fmt.Sprintf(_TPL_UPDATE_HOOK, setting.ScriptType, "\""+setting.AppPath+"\"", setting.CustomConf)), 0777)
 }
 
 type CreateRepoOptions struct {
@@ -864,9 +910,9 @@ func TransferOwnership(u *User, newOwnerName string, repo *Repository) error {
 	}
 
 	// Remove redundant collaborators.
-	collaborators, err := repo.GetCollaborators()
+	collaborators, err := repo.getCollaborators(sess)
 	if err != nil {
-		return fmt.Errorf("GetCollaborators: %v", err)
+		return fmt.Errorf("getCollaborators: %v", err)
 	}
 
 	// Dummy object.
@@ -902,9 +948,9 @@ func TransferOwnership(u *User, newOwnerName string, repo *Repository) error {
 	}
 
 	if newOwner.IsOrganization() {
-		t, err := newOwner.GetOwnerTeam()
+		t, err := newOwner.getOwnerTeam(sess)
 		if err != nil {
-			return fmt.Errorf("GetOwnerTeam: %v", err)
+			return fmt.Errorf("getOwnerTeam: %v", err)
 		} else if err = t.addRepository(sess, repo); err != nil {
 			return fmt.Errorf("add to owner team: %v", err)
 		}
@@ -1125,7 +1171,7 @@ func DeleteRepository(uid, repoID int64) error {
 		desc := fmt.Sprintf("delete repository files[%s]: %v", repoPath, err)
 		log.Warn(desc)
 		if err = CreateRepositoryNotice(desc); err != nil {
-			log.Error(4, "add notice: %v", err)
+			log.Error(4, "CreateRepositoryNotice: %v", err)
 		}
 	}
 
@@ -1268,10 +1314,14 @@ func DeleteRepositoryArchives() error {
 	return x.Where("id > 0").Iterate(new(Repository),
 		func(idx int, bean interface{}) error {
 			repo := bean.(*Repository)
-			if err := repo.GetOwner(); err != nil {
-				return err
+			repoPath, err := repo.RepoPath()
+			if err != nil {
+				if err2 := CreateRepositoryNotice(fmt.Sprintf("DeleteRepositoryArchives[%d]: %v", repo.ID, err)); err2 != nil {
+					log.Error(4, "CreateRepositoryNotice: %v", err2)
+				}
+				return nil
 			}
-			return os.RemoveAll(filepath.Join(RepoPath(repo.Owner.Name, repo.Name), "archives"))
+			return os.RemoveAll(filepath.Join(repoPath, "archives"))
 		})
 }
 
@@ -1280,10 +1330,14 @@ func RewriteRepositoryUpdateHook() error {
 	return x.Where("id > 0").Iterate(new(Repository),
 		func(idx int, bean interface{}) error {
 			repo := bean.(*Repository)
-			if err := repo.GetOwner(); err != nil {
-				return err
+			repoPath, err := repo.RepoPath()
+			if err != nil {
+				if err2 := CreateRepositoryNotice(fmt.Sprintf("RewriteRepositoryUpdateHook[%d]: %v", repo.ID, err)); err2 != nil {
+					log.Error(4, "CreateRepositoryNotice: %v", err2)
+				}
+				return nil
 			}
-			return createUpdateHook(RepoPath(repo.Owner.Name, repo.Name))
+			return createUpdateHook(repoPath)
 		})
 }
 
@@ -1449,6 +1503,12 @@ func CheckRepoStats() {
 			"SELECT `user`.id FROM `user` WHERE `user`.num_repos!=(SELECT COUNT(*) FROM `repository` WHERE owner_id=`user`.id)",
 			"UPDATE `user` SET num_repos=(SELECT COUNT(*) FROM `repository` WHERE owner_id=?) WHERE id=?",
 			"user count 'num_repos'",
+		},
+		// Issue.NumComments
+		{
+			"SELECT `issue`.id FROM `issue` WHERE `issue`.num_comments!=(SELECT COUNT(*) FROM `comment` WHERE issue_id=`issue`.id AND type=0)",
+			"UPDATE `issue` SET num_comments=(SELECT COUNT(*) FROM `comment` WHERE issue_id=? AND type=0) WHERE id=?",
+			"issue count 'num_comments'",
 		},
 	}
 	for i := range checkers {

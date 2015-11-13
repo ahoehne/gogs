@@ -21,6 +21,8 @@ function initCommentPreviewTab($form) {
             }
         );
     });
+
+    buttonsClickOnEnter();
 }
 
 function initCommentForm() {
@@ -384,16 +386,15 @@ function initRepository() {
     // Diff
     if ($('.repository.diff').length > 0) {
         var $counter = $('.diff-counter');
-        if ($counter.length < 1) {
-            return;
+        if ($counter.length >= 1) {
+            $counter.each(function (i, item) {
+                var $item = $(item);
+                var addLine = $item.find('span[data-line].add').data("line");
+                var delLine = $item.find('span[data-line].del').data("line");
+                var addPercent = parseFloat(addLine) / (parseFloat(addLine) + parseFloat(delLine)) * 100;
+                $item.find(".bar .add").css("width", addPercent + "%");
+            });
         }
-        $counter.each(function (i, item) {
-            var $item = $(item);
-            var addLine = $item.find('span[data-line].add').data("line");
-            var delLine = $item.find('span[data-line].del').data("line");
-            var addPercent = parseFloat(addLine) / (parseFloat(addLine) + parseFloat(delLine)) * 100;
-            $item.find(".bar .add").css("width", addPercent + "%");
-        });
     }
 
     // Quick start
@@ -419,6 +420,7 @@ function initRepository() {
             fullTextSearch: true,
             onChange: function (text, value, $choice) {
                 window.location.href = $choice.data('url');
+                console.log($choice.data('url'))
             },
             message: {noResults: $branch_dropdown.data('no-results')}
         });
@@ -535,6 +537,13 @@ function initAdmin() {
             }
         });
     }
+}
+
+function buttonsClickOnEnter() {
+    $('.ui.button').keypress(function(e){
+        if (e.keyCode == 13 || e.keyCode == 32) // enter key or space bar
+            $(this).click();
+    });
 }
 
 $(document).ready(function () {
@@ -669,6 +678,8 @@ $(document).ready(function () {
     $('.show-modal.button').click(function () {
         $($(this).data('modal')).modal('show');
     });
+
+    buttonsClickOnEnter();
 
     initCommentForm();
     initInstall();

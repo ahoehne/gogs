@@ -824,6 +824,9 @@ pre.raw {
 .ui .text.purple {
   color: #6e5494!important;
 }
+.ui .text.yellow {
+  color: #FBBD08!important;
+}
 .ui .text.left {
   text-align: left!important;
 }
@@ -1412,7 +1415,7 @@ footer .container .links > *:first-child {
   border: solid 1px #ccc;
   border-bottom-color: #bbb;
   border-radius: 3px;
-  box-shadow: inset 0 -1px 0 #bbbbbb;
+  box-shadow: inset 0 -1px 0 #bbb;
 }
 .markdown .csv-data td,
 .markdown .csv-data th {
@@ -2285,6 +2288,10 @@ ol.linenums {
 .repository .diff-file-box .code-diff tbody tr:hover pre {
   background-color: transparent !important;
 }
+.repository .diff-file-box.file-content img {
+  max-width: 100%;
+  padding: 5px 5px 0 5px;
+}
 .repository .code-view {
   overflow: auto;
   overflow-x: auto;
@@ -2547,17 +2554,23 @@ ol.linenums {
   height: 16px;
   vertical-align: middle;
 }
+.dashboard.issues .filter.menu .item .text.truncate {
+  width: 85%;
+}
 .dashboard.issues .filter.menu .item .floating.label {
   top: 7px;
   left: 90%;
   width: 15%;
 }
-.dashboard.issues .filter.menu .item.active {
-  background-color: #4183c4;
-  color: #FFF;
+.dashboard.issues .filter.menu .jump.item {
+  margin: 1px;
+  padding-right: 0;
 }
-.dashboard.issues .filter.menu .item .text {
-  width: 85%;
+.dashboard.issues .filter.menu .menu {
+  max-height: 300px;
+  overflow-x: auto;
+  right: 0!important;
+  left: auto!important;
 }
 .dashboard.issues .ui.right .head.menu {
   margin-top: -5px;
